@@ -68,6 +68,15 @@ def test_validation_errors(mutate, msg):
         parse_config(raw, env={"HA_TOKEN": "x"})
 
 
+@pytest.mark.parametrize("name", ["api", "core", "entities", "memory", "host"])
+def test_every_seconds_accepted_on_checks_without_a_default(name):
+    raw = base_raw()
+    raw["checks"][name] = {"every_seconds": 300}
+    cfg = parse_config(raw, env={"HA_TOKEN": "x"})
+    assert cfg.checks[name].every_seconds == 300
+    assert "every_seconds" not in cfg.checks[name].options
+
+
 def test_load_config_bad_yaml(tmp_path):
     p = tmp_path / "c.yaml"
     p.write_text("home_assistant: [unclosed", encoding="utf-8")

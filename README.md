@@ -62,7 +62,7 @@ combination is the reason this exists; the generic parts are deliberately thin.
 
 ## Quick start: Raspberry Pi (or any Linux box)
 
-You need Python 3.11+ (Raspberry Pi OS Bookworm ships 3.11).
+You need Python 3.11+ (Raspberry Pi OS Bookworm ships 3.11, Trixie ships 3.13).
 
 1. In Home Assistant: your profile, **Security** tab, **Long-lived access tokens**,
    create one called `ha-watcher`. See [Security](#security) for which user to create it on.
@@ -292,6 +292,17 @@ default, capped, and announced every time.
 - **Network.** The watcher needs outbound access to HA, the plug and your notifiers only.
   It opens no ports.
 - **The plug.** A Shelly with no password lets anyone on your LAN switch it. Set one.
+
+## Tested on
+
+Real installs, watching a real Home Assistant OS instance. Reports from other hardware welcome.
+
+| Hardware | OS | Python | Install | Running |
+| --- | --- | --- | --- | --- |
+| Raspberry Pi Zero W v1.1 (ARMv6, 512 MB, wifi) | Raspberry Pi OS Lite 32-bit, Trixie (2026-10-06 image) | 3.13.5 | `pip install` from GitHub in about 100 s; every dependency came as a prebuilt armv6l wheel from piwheels, nothing compiled | About 25 MB resident memory. One full cycle of five checks takes about 7 s of mostly start-up time with `--once`; the service averages a few percent CPU at a 60 s interval. |
+
+On a Zero, put the journal in RAM (`Storage=volatile` in a `journald.conf.d` drop-in) to
+spare the SD card; ha-watcher itself only writes its small state file.
 
 ## Limits and honest caveats
 

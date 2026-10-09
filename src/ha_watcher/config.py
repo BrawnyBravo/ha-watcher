@@ -229,7 +229,7 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         if not isinstance(user, dict):
             raise ConfigError(f"checks.{name}: must be a mapping")
         merged = {**defaults, **user}
-        extra = set(merged) - set(defaults)
+        extra = set(merged) - set(defaults) - COMMON_KEYS
         if extra:
             raise ConfigError(f"checks.{name}: unknown key(s) {', '.join(sorted(extra))}")
         fba = merged["failures_before_alert"]
