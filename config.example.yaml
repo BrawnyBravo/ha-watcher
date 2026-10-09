@@ -1,0 +1,101 @@
+# ha-watcher example config. Copy to config.yaml and edit.
+# Secrets come from environment variables: ${NAME} or ${NAME:-default}.
+
+name: Home Assistant             # used in alert titles
+interval_seconds: 60             # how often the loop runs
+state_file: /var/lib/ha-watcher/state.json
+
+home_assistant:
+  url: http://192.0.2.10:8123             # or https://ha.example.com
+  token: ${HA_TOKEN}                      # long-lived access token
+  verify_ssl: true
+  # ca_file: /etc/ha-watcher/ha-ca.pem    # for a self-signed certificate
+  timeout_seconds: 10
+
+checks:
+  api:                         # GET /api/ with the token, and response time
+    enabled: true
+    failures_before_alert: 3   # consecutive failures before alerting
+    max_response_ms: 5000
+
+  core:                        # /api/config: state RUNNING, not in safe/recovery mode
+    enabled: true
+    failures_before_alert: 2
+    alert_on_safe_mode: true
+
+  backup:                      # age of the newest backup
+    enabled: true
+    every_seconds: 1800
+    failures_before_alert: 1
+    source: websocket          # websocket (backup/info, admin token) or sensor
+    max_age_hours: 26
+    # sensor_entity: sensor.backup_last_successful_automatic_backup   # used when source: sensor
+
+  supervisor:                  # HA OS / Supervised only; token must belong to an admin
+    enabled: false
+    every_seconds: 600
+    alert_on_unhealthy: true
+    addons: []                 # e.g. [core_mosquitto, core_zigbee2mqtt]
+
+  entities:                    # alert when these stay unavailable/unknown too long
+    enabled: false
+    max_unavailable_minutes: 15
+    entity_ids:
+      - sensor.living_room_lamp_power
+      - binary_sensor.zigbee_coordinator_connected
+
+  memory:                      # any numeric sensor, e.g. from the System Monitor integration
+    enabled: false
+    entity_id: sensor.system_monitor_memory_usage
+    max_percent: 90
+
+  host:                        # reachability of the machine itself, independent of HA
+    enabled: false
+    host: 192.0.2.10
+    method: tcp                # tcp (connect to port) or ping
+    port: 8123
+    timeout_seconds: 3
+
+alerts:
+  realert_minutes: 60          # remind while still failing; 0 = once per outage
+  max_per_hour: 20             # rate limit; recoveries always go out
+
+notifiers:
+  - type: ntfy
+    server: https://ntfy.sh
+    topic: ${NTFY_TOPIC}
+    # token: ${NTFY_TOKEN}
+  - type: webhook
+    format: discord            # discord, slack or generic
+    url: ${DISCORD_WEBHOOK_URL}
+  - type: email
+    host: smtp.example.com
+    security: starttls         # starttls (587), ssl (465) or none (25)
+    username: watcher@example.com
+    password: ${SMTP_PASSWORD}
+    from: watcher@example.com
+    to: [you@example.com]
+
+heartbeat:                     # one "I'm alive" message per day
+  enabled: true
+  time: "09:00"                # local time of the watcher box
+
+deadman:                       # watch the watcher: healthchecks.io-style ping URL
+  url: ${HC_PING_URL:-}
+  every_seconds: 60
+  signal_failures: false       # true = ping <url>/fail while any alert is open
+
+power_cycle:                   # last resort; OFF by default
+  enabled: false
+  driver: shelly               # shelly (Gen2+ local RPC) or kasa (pip install ha-watcher[kasa])
+  host: 192.0.2.20
+  switch_id: 0
+  username: admin
+  password: ${SHELLY_PASSWORD:-}
+  trigger_checks: [api]        # all of these must be failing
+  after_minutes: 10            # continuous failure before cycling
+  off_seconds: 15
+  cooldown_minutes: 60
+  max_per_day: 2
+  busy_grace_minutes: 120      # hold off if a backup/update was seen running this recently
+  dry_run: false

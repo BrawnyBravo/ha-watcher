@@ -1,0 +1,27 @@
+# systemd unit for ha-watcher. Install:
+#   sudo cp ha-watcher.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ha-watcher
+[Unit]
+Description=ha-watcher - external Home Assistant watchdog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ha-watcher
+Group=ha-watcher
+# Secrets live here (chmod 600, owned by root): HA_TOKEN=..., NTFY_TOPIC=...
+EnvironmentFile=/etc/ha-watcher/env
+ExecStart=/opt/ha-watcher/venv/bin/ha-watcher -c /etc/ha-watcher/config.yaml
+Restart=always
+RestartSec=30
+StateDirectory=ha-watcher
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/ha-watcher
+
+[Install]
+WantedBy=multi-user.target
