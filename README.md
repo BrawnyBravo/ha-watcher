@@ -112,6 +112,21 @@ docker run -d --name ha-watcher --restart unless-stopped \
   ha-watcher
 ```
 
+Or with Compose:
+
+```yaml
+services:
+  ha-watcher:
+    build: .
+    restart: unless-stopped
+    env_file: ./ha-watcher.env
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ha-watcher-data:/data
+volumes:
+  ha-watcher-data:
+```
+
 Set `state_file: /data/state.json`. Do not run the container on the Home Assistant host:
 it would go down with the thing it watches.
 
@@ -125,7 +140,14 @@ ha-watcher -c config.yaml --test-notify   send a test message to every notifier
 ```
 
 `--once` is a real cycle: it updates the state file and can send alerts, so it also works
-from cron if you prefer that to a long-running service.
+from cron if you prefer that to a long-running service:
+
+```
+*/2 * * * * set -a; . /etc/ha-watcher/env; /opt/ha-watcher/venv/bin/ha-watcher -c /etc/ha-watcher/config.yaml --once >/dev/null 2>&1
+```
+
+(Per-check `every_seconds` still applies, because the last run time is kept in the state
+file; the debounce counts runs of that check.)
 
 ## Configuration reference
 
