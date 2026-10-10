@@ -14,6 +14,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- Optional `recovery_command` action: runs a configured command (for example `ha core
+  restart` through an SSH key restricted by a forced command) once Home Assistant has been
+  down for `after_minutes` while the `only_if_passing` checks (typically `host`) still pass.
+  Off by default; cooldown, daily cap, optional busy hold-off and dry run; announced before
+  and after; run history kept in the state file so a watcher restart does not reset the cap.
+  It runs before the power cycle, and the two never act in the same loop. README section
+  "Restarting Home Assistant Core automatically".
 - README "Tested on" section: Raspberry Pi Zero W, Raspberry Pi OS Lite 32-bit (Trixie).
 
 ## [0.1.0] - 2026-10-09

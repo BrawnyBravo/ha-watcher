@@ -33,6 +33,10 @@ Also:
 - **Daily heartbeat** message, so silence means something.
 - **Dead-man ping** to a [healthchecks.io](https://healthchecks.io)-style URL, so the
   watcher itself is watched.
+- Optional **recovery command**: run a command of your choice, typically a remote
+  "restart Home Assistant Core" over a locked-down SSH key, after N minutes down while the
+  machine itself still answers. **Off by default**, with a cooldown and a daily cap, and a
+  message before and after.
 - Optional **power cycle** of the HA host through a smart plug (Shelly Gen2+ local RPC, or
   TP-Link Kasa via python-kasa) after N minutes down. **Off by default**, with a cooldown,
   a daily cap, and a hold-off if a backup or update was running just before the outage.
@@ -161,7 +165,7 @@ error that names the variable. Unknown keys are errors, so typos are caught.
 | --- | --- | --- |
 | `name` | `Home Assistant` | Used in alert titles. |
 | `interval_seconds` | `60` | Loop interval. |
-| `state_file` | `ha-watcher-state.json` | Debounce counters, alert times and power-cycle history. |
+| `state_file` | `ha-watcher-state.json` | Debounce counters, alert times, power-cycle and recovery-command history. |
 
 ### `home_assistant`
 
@@ -253,6 +257,88 @@ notifiers:
 | `busy_grace_minutes` | `120` | Hold off if a backup or update was seen running within this many minutes. |
 | `dry_run` | `false` | Report what would happen without switching. |
 
+### `recovery_command`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Nothing is ever run unless this is true. |
+| `command` | required | The program and its arguments as a list (no shell), e.g. `[ssh, -i, /etc/ha-watcher/restart_key, ...]`. `--check-config` checks the program exists. |
+| `timeout_seconds` | `120` | The command is killed and reported as failed after this long. |
+| `trigger_checks` | `[api]` | Checks that must **all** be failing. Leave `core` out when `api` is listed: `core` is skipped while the API is down, so `[api, core]` would never fire on a full outage. With `[api]` alone, a Core that answers but is still starting (for example a long database migration after an update) is left alone. |
+| `only_if_passing` | `[]` | Checks that must **not** be failing, typically `[host]`: if the machine itself does not answer, a software restart cannot help, so it is left to the power cycle. |
+| `after_minutes` | `10` | Continuous failure before acting, counted from the first failed trigger check. |
+| `cooldown_minutes` | `60` | Minimum gap between runs. |
+| `max_per_day` | `2` | Cap in any rolling 24 hours. Failed attempts count too. The run history lives in the state file, so restarting the watcher does not reset it. |
+| `busy_grace_minutes` | `0` | If above 0, hold off when a backup or update was seen running within this many minutes (same probe as the power cycle). Off by default: a restart is not dangerous the way cutting power is. |
+| `dry_run` | `false` | Report what would happen without running anything. |
+
+## Restarting Home Assistant Core automatically
+
+A hung Core with a healthy machine underneath is the most common outage that does not fix
+itself. The `recovery_command` action covers it without giving the watcher any power over
+the rest of the box: on Home Assistant OS, install the **Advanced SSH & Web Terminal**
+add-on and give the watcher a key that can do exactly one thing.
+
+1. On the watcher box, make a key owned by the service user and readable by it only:
+
+   ```sh
+   sudo -u ha-watcher ssh-keygen -t ed25519 -N "" -C ha-watcher-restart -f /var/lib/ha-watcher/restart_key
+   ```
+
+2. In the add-on configuration, enable the SSH port (Network section) and add the public
+   key to `authorized_keys` with a forced command, so a login with that key runs
+   `ha core restart` and nothing else, whatever the client asks for. The add-on keeps the
+   Supervisor token in a profile script that a forced command does not load, so source it
+   first:
+
+   ```yaml
+   authorized_keys:
+     - >-
+       command=". /etc/profile.d/homeassistant.sh && ha core restart",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding
+       ssh-ed25519 AAAA... ha-watcher-restart
+   ```
+
+   To try the setup without restarting anything, use `ha core info` as the forced command
+   first, then switch to `ha core restart`.
+
+   Leave the add-on password empty if nothing else needs password logins. Check that the
+   key cannot open a shell: `ssh -i ... -tt user@host` must not give you a prompt, and
+   `ssh -i ... user@host id` must run the forced command instead of `id`.
+
+3. Pin the add-on's host key once (`ssh-keyscan -p 22 192.0.2.10 > /etc/ha-watcher/known_hosts`,
+   compare the fingerprint with the add-on log if you can), then configure:
+
+   ```yaml
+   checks:
+     host: {enabled: true, host: 192.0.2.10, method: ping}   # the machine, not HA's port
+   recovery_command:
+     enabled: true
+     command: [ssh, -T, -F, /dev/null, -i, /var/lib/ha-watcher/restart_key, -p, "22",
+               -o, BatchMode=yes, -o, ConnectTimeout=10, -o, IdentitiesOnly=yes,
+               -o, StrictHostKeyChecking=yes, -o, UserKnownHostsFile=/etc/ha-watcher/known_hosts,
+               user@192.0.2.10]
+     timeout_seconds: 600
+     trigger_checks: [api]
+     only_if_passing: [host]
+     after_minutes: 10
+     cooldown_minutes: 60
+     max_per_day: 2
+   ```
+
+   Point the `host` check at something that keeps answering while Core is down (ping, or a
+   TCP port other than 8123), otherwise `only_if_passing: [host]` blocks every restart.
+
+4. Test the command once by hand as the service user (`sudo -u ha-watcher <command>`). It
+   really restarts Home Assistant, so pick a quiet moment. `ha core restart` only returns
+   once Core is back up (about four minutes on a Home Assistant Green), so keep
+   `timeout_seconds` generous.
+
+**With a power cycle as well**, set `power_cycle.after_minutes` well above
+`recovery_command.after_minutes` plus a restart (for example 10 and 20, or 30): the soft
+restart goes first, and the plug only acts if Home Assistant is still down afterwards.
+Giving the power cycle `trigger_checks: [host]` makes it act only when the machine itself
+stops answering. The two never act in the same loop.
+
 ## How the power cycle decides
 
 1. Every trigger check has been failing continuously for `after_minutes`.
@@ -291,6 +377,9 @@ default, capped, and announced every time.
 - **TLS.** Leave `verify_ssl` on. For a self-signed certificate set `ca_file`.
 - **Network.** The watcher needs outbound access to HA, the plug and your notifiers only.
   It opens no ports.
+- **The recovery command** runs with the watcher's own rights, with no shell, and its output
+  is trimmed to one line in messages. For SSH, use a dedicated key with a forced command
+  (above) so that a stolen key can only restart Home Assistant.
 - **The plug.** A Shelly with no password lets anyone on your LAN switch it. Set one.
 
 ## Tested on
