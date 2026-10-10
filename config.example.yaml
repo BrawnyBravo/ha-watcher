@@ -107,7 +107,7 @@ recovery_command:              # soft fix before the plug; OFF by default. See R
             -o, BatchMode=yes, -o, ConnectTimeout=10, -o, IdentitiesOnly=yes,
             -o, StrictHostKeyChecking=yes, -o, UserKnownHostsFile=/etc/ha-watcher/known_hosts,
             hassio@192.0.2.10]
-  timeout_seconds: 300
+  timeout_seconds: 600            # "ha core restart" waits until Core is back: ~4 min seen
   trigger_checks: [api]        # all of these must be failing
   only_if_passing: []          # e.g. [host] (with host.method: ping): skip if the box is gone
   after_minutes: 10            # keep below power_cycle.after_minutes

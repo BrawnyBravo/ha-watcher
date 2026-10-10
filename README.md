@@ -264,7 +264,7 @@ notifiers:
 | `enabled` | `false` | Nothing is ever run unless this is true. |
 | `command` | required | The program and its arguments as a list (no shell), e.g. `[ssh, -i, /etc/ha-watcher/restart_key, ...]`. `--check-config` checks the program exists. |
 | `timeout_seconds` | `120` | The command is killed and reported as failed after this long. |
-| `trigger_checks` | `[api]` | Checks that must **all** be failing. |
+| `trigger_checks` | `[api]` | Checks that must **all** be failing. Leave `core` out when `api` is listed: `core` is skipped while the API is down, so `[api, core]` would never fire on a full outage. With `[api]` alone, a Core that answers but is still starting (for example a long database migration after an update) is left alone. |
 | `only_if_passing` | `[]` | Checks that must **not** be failing, typically `[host]`: if the machine itself does not answer, a software restart cannot help, so it is left to the power cycle. |
 | `after_minutes` | `10` | Continuous failure before acting, counted from the first failed trigger check. |
 | `cooldown_minutes` | `60` | Minimum gap between runs. |
@@ -317,7 +317,7 @@ add-on and give the watcher a key that can do exactly one thing.
                -o, BatchMode=yes, -o, ConnectTimeout=10, -o, IdentitiesOnly=yes,
                -o, StrictHostKeyChecking=yes, -o, UserKnownHostsFile=/etc/ha-watcher/known_hosts,
                user@192.0.2.10]
-     timeout_seconds: 300
+     timeout_seconds: 600
      trigger_checks: [api]
      only_if_passing: [host]
      after_minutes: 10
@@ -329,7 +329,9 @@ add-on and give the watcher a key that can do exactly one thing.
    TCP port other than 8123), otherwise `only_if_passing: [host]` blocks every restart.
 
 4. Test the command once by hand as the service user (`sudo -u ha-watcher <command>`). It
-   really restarts Home Assistant, so pick a quiet moment.
+   really restarts Home Assistant, so pick a quiet moment. `ha core restart` only returns
+   once Core is back up (about four minutes on a Home Assistant Green), so keep
+   `timeout_seconds` generous.
 
 **With a power cycle as well**, set `power_cycle.after_minutes` well above
 `recovery_command.after_minutes` plus a restart (for example 10 and 20, or 30): the soft
