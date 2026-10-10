@@ -1,4 +1,4 @@
-"""The watch loop: run due checks, debounce, alert, recover, heartbeat, dead-man, power."""
+"""The watch loop: run due checks, debounce, alert, recover, heartbeat, dead-man, actions."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Any
 
 import httpx
 
-from ha_watcher import power
+from ha_watcher import power, recovery
 from ha_watcher.checks import CHECKS, NEEDS_API, Context, Result, detect_busy, fmt_age
 from ha_watcher.config import Config
 from ha_watcher.ha import HAClient, HAError
@@ -32,6 +32,7 @@ class Watcher:
         notifiers: list[Notifier],
         http: httpx.Client,
         driver: Any = None,
+        runner: Any = None,
         ctx_hooks: dict[str, Any] | None = None,
         local_tz: tzinfo | None = None,
         state_path: str | None = None,
@@ -41,6 +42,7 @@ class Watcher:
         self.notifiers = notifiers
         self.http = http  # used for the dead-man ping
         self.driver = driver
+        self.runner = runner  # subprocess.run stand-in for the recovery command (tests)
         self.ctx_hooks = ctx_hooks or {}
         self.local_tz = local_tz
         self.state_path = state_path or cfg.state_file
@@ -53,7 +55,8 @@ class Watcher:
         alerts, recoveries = self._update(results, ran, now)
         self._deliver(alerts, recoveries, now)
         self._busy_probe(results, now)
-        self._maybe_power_cycle(now)
+        if not self._maybe_recovery_command(now):
+            self._maybe_power_cycle(now)
         self._heartbeat(now)
         self._deadman(now)
         save_state(self.state_path, self.state)
@@ -195,7 +198,8 @@ class Watcher:
 
     # ------------------------------------------------------------------- power
     def _busy_probe(self, results: list[Result], now: datetime) -> None:
-        if not self.cfg.power_cycle.enabled:
+        rc = self.cfg.recovery_command
+        if not (self.cfg.power_cycle.enabled or (rc.enabled and rc.busy_grace_minutes)):
             return
         if not any(r.key == "api" and r.ok for r in results):
             return
@@ -208,10 +212,10 @@ class Watcher:
             self.state["power"]["busy_seen"] = ts(now)
             self.state["power"]["busy_reason"] = "; ".join(reasons)
 
-    def _down_since(self, now: datetime) -> datetime | None:
+    def _down_since(self, trigger_checks: list[str]) -> datetime | None:
         """When all trigger checks have been failing since, or None if any is passing."""
         starts = []
-        for check in self.cfg.power_cycle.trigger_checks:
+        for check in trigger_checks:
             failing = [
                 parse(v["first_failure"])
                 for v in self.state["checks"].values()
@@ -229,7 +233,12 @@ class Watcher:
         pstate = self.state["power"]
         cycles = [parse(c) for c in pstate["cycles"] if now - parse(c) < timedelta(days=2)]
         decision = power.decide(
-            pc, now, self._down_since(now), cycles, parse(pstate["busy_seen"]), pstate["busy_reason"]
+            pc,
+            now,
+            self._down_since(pc.trigger_checks),
+            cycles,
+            parse(pstate["busy_seen"]),
+            pstate["busy_reason"],
         )
         changed = decision.reason != pstate["last_decision"]
         pstate["last_decision"] = decision.reason
@@ -250,6 +259,71 @@ class Watcher:
             self._send(
                 Message(f"{self.cfg.name}: power cycle FAILED", str(exc), "alert"), now, bypass_limit=True
             )
+
+    # --------------------------------------------------------- recovery command
+    def _maybe_recovery_command(self, now: datetime) -> bool:
+        """Run the recovery command if its guards allow. Returns True if it ran this loop."""
+        rc = self.cfg.recovery_command
+        if not rc.enabled:
+            return False
+        rstate = self.state["recovery"]
+        runs = [parse(r) for r in rstate["runs"] if now - parse(r) < timedelta(days=2)]
+        blocking = [c for c in rc.only_if_passing if self._failing_check(c)]
+        pstate = self.state["power"]
+        decision = recovery.decide(
+            rc,
+            now,
+            self._down_since(rc.trigger_checks),
+            runs,
+            blocking,
+            parse(pstate["busy_seen"]),
+            pstate["busy_reason"],
+        )
+        changed = decision.reason != rstate["last_decision"]
+        rstate["last_decision"] = decision.reason
+        if not decision.allowed:
+            if changed and decision.reason.startswith(("held off", "daily cap", "cooldown", "skipped")):
+                log.warning("recovery command not run: %s", decision.reason)
+            return False
+        name = self.cfg.name
+        attempt = len([r for r in runs if now - r < timedelta(hours=24)]) + 1
+        self._send(
+            Message(
+                f"{name}: restarting",
+                f"{name} has been down for {decision.down_minutes} min but the machine still answers. "
+                f"Restarting it now (attempt {attempt} of {rc.max_per_day} allowed per day).",
+                "alert",
+            ),
+            now,
+            bypass_limit=True,
+        )
+        if not rc.dry_run:
+            runs.append(now)  # count failed attempts too, so a broken command is not hammered
+        rstate["runs"] = [ts(r) for r in runs]
+        save_state(self.state_path, self.state)  # remember the attempt even if we die mid-command
+        try:
+            outcome = recovery.run_command(rc, self.runner)
+        except recovery.RecoveryError as exc:
+            self._send(
+                Message(f"{name}: restart FAILED", f"The restart command did not work: {exc}.", "alert"),
+                now,
+                bypass_limit=True,
+            )
+            return True
+        self._send(
+            Message(
+                f"{name}: restart sent",
+                f"Result: {outcome}. Waiting for {name} to come back; "
+                "a recovery message follows when it does.",
+                "info",
+            ),
+            now,
+            bypass_limit=True,
+        )
+        return True
+
+    def _failing_check(self, check: str) -> bool:
+        return any(v["check"] == check and not v["ok"] for v in self.state["checks"].values())
 
     # -------------------------------------------------------- heartbeat / dead-man
     def _heartbeat(self, now: datetime) -> None:

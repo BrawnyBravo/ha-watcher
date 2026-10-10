@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
 
 import httpx
@@ -40,6 +41,15 @@ def summarize(cfg: Config) -> str:
         )
     else:
         lines.append("Power cycle: off")
+    rc = cfg.recovery_command
+    if rc.enabled:
+        guard = f", only while {', '.join(rc.only_if_passing)} passes" if rc.only_if_passing else ""
+        lines.append(
+            f"Recovery command: {rc.command[0]} after {rc.after_minutes:g}m down{guard}, cooldown "
+            f"{rc.cooldown_minutes:g}m, max {rc.max_per_day}/day{' (dry run)' if rc.dry_run else ''}"
+        )
+    else:
+        lines.append("Recovery command: off")
     return "\n".join(lines)
 
 
@@ -71,6 +81,9 @@ def main(argv: list[str] | None = None) -> int:
             build_notifiers(cfg.notifiers, httpx.Client())
             if cfg.power_cycle.enabled:
                 build_driver(cfg.power_cycle)
+            rc = cfg.recovery_command
+            if rc.enabled and not shutil.which(rc.command[0]):
+                raise ValueError(f"recovery_command: '{rc.command[0]}' not found or not executable")
         except (ValueError, PowerError) as exc:
             print(f"config error: {exc}", file=sys.stderr)
             return 2

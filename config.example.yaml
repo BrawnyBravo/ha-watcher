@@ -99,3 +99,19 @@ power_cycle:                   # last resort; OFF by default
   max_per_day: 2
   busy_grace_minutes: 120      # hold off if a backup/update was seen running this recently
   dry_run: false
+
+recovery_command:              # soft fix before the plug; OFF by default. See README.
+  enabled: false
+  # argv list, no shell. Example: an SSH key whose forced command is "ha core restart".
+  command: [ssh, -T, -F, /dev/null, -i, /var/lib/ha-watcher/restart_key, -p, "22",
+            -o, BatchMode=yes, -o, ConnectTimeout=10, -o, IdentitiesOnly=yes,
+            -o, StrictHostKeyChecking=yes, -o, UserKnownHostsFile=/etc/ha-watcher/known_hosts,
+            hassio@192.0.2.10]
+  timeout_seconds: 300
+  trigger_checks: [api]        # all of these must be failing
+  only_if_passing: []          # e.g. [host] (with host.method: ping): skip if the box is gone
+  after_minutes: 10            # keep below power_cycle.after_minutes
+  cooldown_minutes: 60
+  max_per_day: 2
+  busy_grace_minutes: 0        # >0: hold off if a backup/update was seen running this recently
+  dry_run: false

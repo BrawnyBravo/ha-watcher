@@ -102,6 +102,22 @@ class PowerCycleConfig:
 
 
 @dataclass
+class RecoveryCommandConfig:
+    """Run a command (e.g. a remote "restart HA Core") when HA is down but the box answers."""
+
+    enabled: bool = False
+    command: list[str] = field(default_factory=list)  # argv, no shell
+    timeout_seconds: float = 120.0
+    trigger_checks: list[str] = field(default_factory=lambda: ["api"])
+    only_if_passing: list[str] = field(default_factory=list)  # e.g. [host]
+    after_minutes: float = 10.0
+    cooldown_minutes: float = 60.0
+    max_per_day: int = 2
+    busy_grace_minutes: float = 0.0  # 0 = do not hold off for backups/updates
+    dry_run: bool = False
+
+
+@dataclass
 class Config:
     home_assistant: HomeAssistantConfig
     checks: dict[str, CheckConfig]
@@ -113,6 +129,7 @@ class Config:
     heartbeat: HeartbeatConfig = field(default_factory=HeartbeatConfig)
     deadman: DeadmanConfig = field(default_factory=DeadmanConfig)
     power_cycle: PowerCycleConfig = field(default_factory=PowerCycleConfig)
+    recovery_command: RecoveryCommandConfig = field(default_factory=RecoveryCommandConfig)
 
 
 # Defaults for each check. Anything not listed in COMMON_KEYS is check-specific.
@@ -173,6 +190,7 @@ TOP_LEVEL_KEYS = {
     "heartbeat",
     "deadman",
     "power_cycle",
+    "recovery_command",
 }
 
 
@@ -262,6 +280,7 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         heartbeat=_build(HeartbeatConfig, _section(raw, "heartbeat"), "heartbeat"),
         deadman=_build(DeadmanConfig, _section(raw, "deadman"), "deadman"),
         power_cycle=_build(PowerCycleConfig, _section(raw, "power_cycle"), "power_cycle"),
+        recovery_command=_build(RecoveryCommandConfig, _section(raw, "recovery_command"), "recovery_command"),
     )
     _positive(cfg.interval_seconds, "interval_seconds")
     _positive(cfg.alerts.realert_minutes, "alerts.realert_minutes", allow_zero=True)
@@ -269,6 +288,7 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(cfg.heartbeat.time)):
         raise ConfigError("heartbeat.time must be HH:MM (24-hour, local time)")
     _validate_power(cfg.power_cycle, checks)
+    _validate_recovery(cfg.recovery_command, checks)
     return cfg
 
 
@@ -306,6 +326,33 @@ def _validate_power(p: PowerCycleConfig, checks: dict[str, CheckConfig]) -> None
     _positive(p.off_seconds, "power_cycle.off_seconds")
     _positive(p.cooldown_minutes, "power_cycle.cooldown_minutes", allow_zero=True)
     _positive(p.max_per_day, "power_cycle.max_per_day")
+
+
+def _validate_recovery(r: RecoveryCommandConfig, checks: dict[str, CheckConfig]) -> None:
+    if not r.enabled:
+        return
+    if (
+        not isinstance(r.command, list)
+        or not r.command
+        or not all(isinstance(a, str) and a for a in r.command)
+    ):
+        raise ConfigError("recovery_command.command must be a non-empty list of strings (argv, no shell)")
+    if not r.trigger_checks:
+        raise ConfigError("recovery_command.trigger_checks: list at least one check")
+    for key in ("trigger_checks", "only_if_passing"):
+        for name in getattr(r, key):
+            if name not in checks or not checks[name].enabled:
+                raise ConfigError(f"recovery_command.{key}: '{name}' is not an enabled check")
+    overlap = set(r.trigger_checks) & set(r.only_if_passing)
+    if overlap:
+        raise ConfigError(
+            f"recovery_command: {', '.join(sorted(overlap))} cannot be both a trigger and in only_if_passing"
+        )
+    _positive(r.timeout_seconds, "recovery_command.timeout_seconds")
+    _positive(r.after_minutes, "recovery_command.after_minutes")
+    _positive(r.cooldown_minutes, "recovery_command.cooldown_minutes", allow_zero=True)
+    _positive(r.max_per_day, "recovery_command.max_per_day")
+    _positive(r.busy_grace_minutes, "recovery_command.busy_grace_minutes", allow_zero=True)
 
 
 def load_config(path: str | Path, env: dict[str, str] | None = None) -> Config:

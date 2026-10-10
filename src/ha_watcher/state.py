@@ -25,6 +25,7 @@ def empty_state() -> dict[str, Any]:
         "heartbeat_last": None,
         "deadman_last": None,
         "power": {"cycles": [], "busy_seen": None, "busy_reason": None, "last_decision": None},
+        "recovery": {"runs": [], "last_decision": None},
     }
 
 
@@ -42,6 +43,7 @@ def load_state(path: str | Path) -> dict[str, Any]:
     base = empty_state()
     base.update(data)
     base["power"] = {**empty_state()["power"], **(data.get("power") or {})}
+    base["recovery"] = {**empty_state()["recovery"], **(data.get("recovery") or {})}
     return base
 
 
