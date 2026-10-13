@@ -133,8 +133,9 @@ class PhoneEscalation:
         st = self.state
         calls = [parse(c) for c in st["calls"] if now - parse(c) < timedelta(days=2)]
         st["calls"] = [ts(c) for c in calls]
-        if down_since is None:
-            st["called_outage"] = None  # outage over; the next one may call again
+        # called_outage is kept after the outage ends: a new outage has a later start, so it
+        # can call again, while a brief "up" inside the same outage (an API that answers while
+        # Core is still starting keeps its first failure time) does not earn a second call.
         decision = decide(
             self.cfg, now, down_since, calls, parse(st["called_outage"]), parse(st["last_attempt"])
         )

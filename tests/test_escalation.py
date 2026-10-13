@@ -144,9 +144,21 @@ def test_new_outage_after_recovery_can_call_again(tmp_path):
     t = minutes(w, NOW, 40)
     fake.routes.update(UP)
     t = minutes(w, t, 5)
-    assert w.state["phone"]["called_outage"] is None
     fake.routes.update(API_DOWN)
     minutes(w, t, 40)
+    assert len(phone.calls) == 2
+
+
+def test_a_brief_up_inside_the_same_outage_does_not_call_again(tmp_path):
+    # An outage keeps its start time across a held recovery (API answering while Core is
+    # still starting): seeing "up" for a loop must not re-arm the call for that outage.
+    w, _, phone = build(tmp_path, FakeHA(API_DOWN))
+    start = NOW - 60 * M
+    w.phone.run(NOW, start)
+    w.phone.run(NOW + 14 * M, None)
+    w.phone.run(NOW + 15 * M, start)  # past retry_minutes, so only the outage id blocks it
+    assert len(phone.calls) == 1
+    w.phone.run(NOW + 60 * M, NOW + 20 * M)  # a genuinely new outage
     assert len(phone.calls) == 2
 
 
