@@ -22,8 +22,24 @@ from ha_watcher.state import load_state, parse, save_state, ts
 log = logging.getLogger(__name__)
 
 
+STARTING_STATES = {"NOT_RUNNING", "STARTING"}
+STARTUP_HOLD = timedelta(minutes=15)
+
+
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _new_check_state(check: str) -> dict[str, Any]:
+    return {
+        "check": check,
+        "ok": True,
+        "failures": 0,
+        "alerting": False,
+        "first_failure": None,
+        "last_alert": None,
+        "message": "",
+    }
 
 
 class Watcher:
@@ -126,31 +142,46 @@ class Watcher:
         recoveries: list[str] = []
         realert = timedelta(minutes=self.cfg.alerts.realert_minutes)
         seen: set[str] = set()
+        # After the API comes back, Core reports NOT_RUNNING for a minute or two while it
+        # starts. That start-up is part of the same outage: hold the API recovery until Core
+        # is RUNNING and keep Core quiet meanwhile, so one restart gives one alert and one
+        # recovery. After STARTUP_HOLD a Core that never finishes starting alerts on its own.
+        core_starting = any(
+            r.key == "core" and not r.ok and r.data.get("state") in STARTING_STATES for r in results
+        )
 
         for r in results:
             seen.add(r.key)
             check = r.data["check"]
             need = self.cfg.checks[check].failures_before_alert
-            st = checks.setdefault(
-                r.key,
-                {
-                    "check": check,
-                    "ok": True,
-                    "failures": 0,
-                    "alerting": False,
-                    "first_failure": None,
-                    "last_alert": None,
-                    "message": "",
-                },
-            )
+            api_st = checks.get("api")
+            if (
+                r.key == "core"
+                and not r.ok
+                and r.data.get("state") in STARTING_STATES
+                and api_st
+                and api_st.get("held_since")
+                and now - parse(api_st["held_since"]) < STARTUP_HOLD
+            ):
+                st = checks.setdefault(r.key, _new_check_state(check))
+                st.update(message=r.message, ok=False, failures=st["failures"] + 1)
+                st["first_failure"] = st["first_failure"] or ts(now)
+                continue
+            st = checks.setdefault(r.key, _new_check_state(check))
             st["message"] = r.message
             if r.ok:
+                if st["alerting"] and r.key == "api" and core_starting:
+                    st.update(ok=True, failures=0, held_since=st.get("held_since") or ts(now))
+                    continue
                 if st["alerting"]:
                     first = parse(st["first_failure"])
                     took = f" (was failing for {fmt_age((now - first).total_seconds())})" if first else ""
-                    recoveries.append(f"{r.message}{took}")
+                    held = "; Core is RUNNING again" if st.get("held_since") else ""
+                    recoveries.append(f"{r.message}{held}{took}")
                 st.update(ok=True, failures=0, alerting=False, first_failure=None, last_alert=None)
+                st.pop("held_since", None)
                 continue
+            st.pop("held_since", None)
             st["ok"] = False
             st["failures"] += 1
             st["first_failure"] = st["first_failure"] or ts(now)

@@ -334,3 +334,67 @@ def test_power_needs_all_trigger_checks(tmp_path):
     w.ctx_hooks = up  # host still answers, so HA is not "down" for cycling purposes
     run(w, fake, 20)
     assert plug.cycles == 0
+
+
+# ------------------------------------------------------- restart = one outage
+STARTING = {"/api/config": (200, {"state": "NOT_RUNNING", "version": "2026.1.0"})}
+RUNNING = {"/api/config": (200, {"state": "RUNNING", "version": "2026.1.0"})}
+
+
+def test_core_start_up_after_api_outage_is_one_alert_and_one_recovery(tmp_path):
+    # The live pattern of 11 Oct 2026: API times out for a few minutes, then answers while
+    # Core is still NOT_RUNNING for two minutes. That used to send four messages.
+    fake = FakeHA(API_DOWN)
+    w, inbox, _ = watcher(tmp_path, fake, checks={"backup": {"enabled": False}})
+    for i in range(5):
+        w.run_once(NOW + i * M)
+    fake.routes["/api/"] = (200, {"message": "API running."})
+    fake.routes.update(STARTING)
+    w.run_once(NOW + 5 * M)
+    w.run_once(NOW + 6 * M)
+    w.run_once(NOW + 7 * M)
+    assert [m.severity for m in inbox.msgs] == ["alert"]
+    fake.routes.update(RUNNING)
+    w.run_once(NOW + 8 * M)
+    assert [m.severity for m in inbox.msgs] == ["alert", "recovery"]
+    assert "Core is RUNNING again" in inbox.msgs[1].body
+    assert "was failing for 8m" in inbox.msgs[1].body
+    w.run_once(NOW + 9 * M)
+    assert len(inbox.msgs) == 2 and "held_since" not in w.state["checks"]["api"]
+
+
+def test_held_api_does_not_trigger_the_recovery_command(tmp_path):
+    fake = FakeHA(API_DOWN)
+    w, inbox, _ = watcher(tmp_path, fake, checks={"backup": {"enabled": False}})
+    run(w, fake, 3)
+    fake.routes["/api/"] = (200, {"message": "API running."})
+    fake.routes.update(STARTING)
+    w.run_once(NOW + 3 * M)
+    assert w._down_since(["api"]) is None
+
+
+def test_core_that_never_finishes_starting_alerts_after_the_hold(tmp_path):
+    fake = FakeHA(API_DOWN)
+    w, inbox, _ = watcher(
+        tmp_path, fake, checks={"backup": {"enabled": False}}, alerts={"realert_minutes": 0}
+    )
+    run(w, fake, 3)
+    fake.routes["/api/"] = (200, {"message": "API running."})
+    fake.routes.update(STARTING)
+    for i in range(3, 3 + 14):
+        w.run_once(NOW + i * M)
+    assert len(inbox.msgs) == 1
+    for i in range(17, 20):
+        w.run_once(NOW + i * M)
+    assert len(inbox.msgs) == 2 and "NOT_RUNNING" in inbox.msgs[1].body
+    fake.routes.update(RUNNING)
+    w.run_once(NOW + 20 * M)
+    assert inbox.msgs[2].severity == "recovery"
+    assert "API OK" in inbox.msgs[2].body and "Core state is RUNNING" in inbox.msgs[2].body
+
+
+def test_core_not_running_without_an_api_outage_still_alerts(tmp_path):
+    fake = FakeHA(STARTING)
+    w, inbox, _ = watcher(tmp_path, fake, checks={"backup": {"enabled": False}})
+    run(w, fake, 4)
+    assert len(inbox.msgs) == 1 and "NOT_RUNNING" in inbox.msgs[0].body

@@ -8,6 +8,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- A Home Assistant restart now sends one alert and one recovery instead of four. After the
+  API came back, Core reported `NOT_RUNNING` for a minute or two while it started, which
+  sent "recovered", then a new Core "problem", then a second "recovered". The API recovery
+  is now held until Core is `RUNNING` (the message says so), and Core stays quiet during
+  that start-up. A Core that is still not running after 15 minutes alerts on its own. A
+  held API counts as up, so the recovery command and power cycle do not fire on it.
+
 - `every_seconds` is now accepted on every check, as documented. It was rejected as an
   unknown key on checks that have no default for it (`api`, `core`, `entities`, `memory`,
   `host`). Found on the first real install.
