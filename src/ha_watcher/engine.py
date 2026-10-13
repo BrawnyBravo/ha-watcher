@@ -162,7 +162,9 @@ class Watcher:
         for holder, key in (
             (self.state, "alert_times"),
             (self.state["power"], "cycles"),
+            (self.state["power"], "dry_cycles"),
             (self.state["recovery"], "runs"),
+            (self.state["recovery"], "dry_runs"),
             (phone, "calls"),
         ):
             holder[key] = [t if parse(t) <= now else stamp for t in holder[key]]
@@ -366,7 +368,8 @@ class Watcher:
         if not pc.enabled:
             return
         pstate = self.state["power"]
-        cycles = [parse(c) for c in pstate["cycles"] if now - parse(c) < timedelta(days=2)]
+        key = "dry_cycles" if pc.dry_run else "cycles"
+        cycles = [parse(c) for c in pstate[key] if now - parse(c) < timedelta(days=2)]
         decision = power.decide(
             pc,
             now,
@@ -381,12 +384,11 @@ class Watcher:
             if changed and decision.reason.startswith(("held off", "daily cap", "cooldown")):
                 log.warning("power cycle not done: %s", decision.reason)
             return
-        if not pc.dry_run:
-            # Count the attempt before touching the plug, failed or not, and save it, so
-            # neither a broken plug nor a crash mid-cycle can lead to cycling every loop.
-            cycles.append(now)
-            pstate["cycles"] = [ts(c) for c in cycles]
-            save_state(self.state_path, self.state)
+        # Count the attempt before touching the plug, failed or not, and save it, so
+        # neither a broken plug nor a crash mid-cycle can lead to cycling every loop.
+        cycles.append(now)
+        pstate[key] = [ts(c) for c in cycles]
+        save_state(self.state_path, self.state)
         try:
             outcome = power.run_cycle(self.driver, pc)
         except power.PowerError as exc:
@@ -404,7 +406,8 @@ class Watcher:
         if not rc.enabled:
             return False
         rstate = self.state["recovery"]
-        runs = [parse(r) for r in rstate["runs"] if now - parse(r) < timedelta(days=2)]
+        key = "dry_runs" if rc.dry_run else "runs"
+        runs = [parse(r) for r in rstate[key] if now - parse(r) < timedelta(days=2)]
         blocking = [c for c in rc.only_if_passing if self._failing_check(c)]
         pstate = self.state["power"]
         decision = recovery.decide(
@@ -434,9 +437,8 @@ class Watcher:
             now,
             bypass_limit=True,
         )
-        if not rc.dry_run:
-            runs.append(now)  # count failed attempts too, so a broken command is not hammered
-        rstate["runs"] = [ts(r) for r in runs]
+        runs.append(now)  # count failed attempts too, so a broken command is not hammered
+        rstate[key] = [ts(r) for r in runs]
         save_state(self.state_path, self.state)  # remember the attempt even if we die mid-command
         try:
             outcome = recovery.run_command(rc, self.runner)

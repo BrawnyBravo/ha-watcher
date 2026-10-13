@@ -25,8 +25,16 @@ def empty_state() -> dict[str, Any]:
         "heartbeat_last": None,
         "deadman_last": None,
         "last_loop": None,
-        "power": {"cycles": [], "busy_seen": None, "busy_reason": None, "last_decision": None},
-        "recovery": {"runs": [], "last_decision": None},
+        # dry_* lists: what a dry run would have done, so it keeps the same cooldown and cap
+        # (one message per would-be action) without counting against the real ones.
+        "power": {
+            "cycles": [],
+            "dry_cycles": [],
+            "busy_seen": None,
+            "busy_reason": None,
+            "last_decision": None,
+        },
+        "recovery": {"runs": [], "dry_runs": [], "last_decision": None},
         "expiry": {"items": {}, "rdap_servers": {}, "rdap_backoff_until": None},
         "phone": {"calls": [], "called_outage": None, "last_attempt": None, "last_decision": None},
     }
@@ -47,7 +55,14 @@ def load_state(path: str | Path) -> dict[str, Any]:
 
 
 CHECK_KEYS = {"check": str, "ok": bool, "failures": int, "alerting": bool, "message": str}
-TIME_LISTS = {("alert_times",), ("power", "cycles"), ("recovery", "runs"), ("phone", "calls")}
+TIME_LISTS = {
+    ("alert_times",),
+    ("power", "cycles"),
+    ("power", "dry_cycles"),
+    ("recovery", "runs"),
+    ("recovery", "dry_runs"),
+    ("phone", "calls"),
+}
 TIMES = {
     ("deadman_last",),
     ("last_loop",),

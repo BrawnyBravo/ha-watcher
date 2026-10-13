@@ -146,6 +146,14 @@ def test_dry_run(tmp_path):
     assert w.state["recovery"]["runs"] == []
 
 
+def test_dry_run_keeps_the_cooldown_so_it_does_not_message_every_loop(tmp_path):
+    w, inbox = make(tmp_path, Runner(), rc={"dry_run": True}, alerts={"realert_minutes": 0})
+    loop(w, 0, 60)
+    restarting = [m for m in inbox.msgs if m.title.endswith("restarting")]
+    assert len(restarting) == 1
+    assert w.state["recovery"]["runs"] == [] and len(w.state["recovery"]["dry_runs"]) == 1
+
+
 def test_soft_restart_first_power_cycle_later(tmp_path):
     runner, plug = Runner(), Plug()
     w, _ = make(

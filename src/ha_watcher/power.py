@@ -7,6 +7,7 @@ Off by default. Guarded by a minimum outage length, a cooldown, a daily cap, and
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -65,8 +66,10 @@ class KasaDriver:
         cfg: PowerCycleConfig,
         discover: Callable[..., Any] | None = None,
         sleep: Callable[[float], Any] | None = None,
+        step_timeout: float = 20.0,
     ) -> None:
         self.cfg = cfg
+        self.step_timeout = step_timeout  # every network step is bounded, so a cycle cannot hang
         if discover is None:
             try:
                 from kasa import Discover
@@ -77,24 +80,30 @@ class KasaDriver:
         self.sleep = sleep or asyncio.sleep
 
     async def _cycle(self, off_seconds: int) -> None:
-        dev = await self.discover(self.cfg.host, username=self.cfg.username, password=self.cfg.password)
+        def bounded(aw: Any) -> Any:
+            return asyncio.wait_for(aw, self.step_timeout)
+
+        dev = await bounded(
+            self.discover(self.cfg.host, username=self.cfg.username, password=self.cfg.password)
+        )
         if dev is None:
             raise PowerError("Kasa device not found")
         try:
-            await dev.update()
-            await dev.turn_off()
+            await bounded(dev.update())
+            await bounded(dev.turn_off())
             await self.sleep(off_seconds)
             last: Exception | None = None
             for _ in range(3):  # Kasa cannot switch itself back on, so try hard
                 try:
-                    await dev.turn_on()
+                    await bounded(dev.turn_on())
                     return
                 except Exception as exc:  # noqa: BLE001
                     last = exc
                     await self.sleep(2)
             raise PowerError(f"Kasa plug did not turn back on: {type(last).__name__}")
         finally:
-            await dev.disconnect()
+            with contextlib.suppress(Exception):  # the cycle itself is what matters
+                await bounded(dev.disconnect())
 
     def power_cycle(self, off_seconds: int) -> None:
         try:

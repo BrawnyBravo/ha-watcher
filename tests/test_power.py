@@ -144,6 +144,29 @@ def test_run_cycle_dry_run_does_not_touch_driver():
     assert "dry run" in run_cycle(Boom(), pc(dry_run=True))
 
 
+def test_kasa_steps_are_bounded_so_a_silent_plug_cannot_hang_the_watcher():
+    import asyncio
+
+    async def hang(*a, **kw):
+        await asyncio.sleep(3600)
+
+    d = KasaDriver(pc(driver="kasa"), discover=hang, step_timeout=0.05)
+    with pytest.raises(PowerError, match="TimeoutError"):
+        d.power_cycle(1)
+
+    class Stuck(FakePlug):
+        async def turn_on(self):
+            self.calls.append("on")
+            await asyncio.sleep(3600)
+
+    plug, sleeps = Stuck(), []
+    d = kasa(plug, sleeps)
+    d.step_timeout = 0.05
+    with pytest.raises(PowerError, match="did not turn back on: TimeoutError"):
+        d.power_cycle(15)
+    assert plug.calls.count("on") == 3 and plug.calls[-1] == "disconnect"
+
+
 def test_shelly_non_json_reply_is_a_power_error():
     t = httpx.MockTransport(lambda r: httpx.Response(200, text="<html>not rpc</html>"))
     with pytest.raises(PowerError, match="not understood"):

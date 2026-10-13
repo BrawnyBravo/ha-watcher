@@ -321,6 +321,16 @@ def test_power_dry_run(tmp_path):
     assert any("dry run" in m.body for m in inbox.msgs)
 
 
+def test_power_dry_run_keeps_the_cooldown_so_it_does_not_message_every_loop(tmp_path):
+    fake, plug = FakeHA(API_DOWN), Plug()
+    w, inbox, _ = watcher(
+        tmp_path, fake, plug=plug, power_cycle={**PC, "dry_run": True}, alerts={"realert_minutes": 0}
+    )
+    run(w, fake, 60)
+    assert len([m for m in inbox.msgs if "dry run" in m.body]) == 1
+    assert w.state["power"]["cycles"] == [] and len(w.state["power"]["dry_cycles"]) == 1
+
+
 def test_power_needs_all_trigger_checks(tmp_path):
     fake, plug = FakeHA(API_DOWN), Plug()
     up = {"tcp_connect": lambda h, p, t: None}
