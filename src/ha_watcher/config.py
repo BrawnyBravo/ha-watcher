@@ -118,6 +118,47 @@ class RecoveryCommandConfig:
 
 
 @dataclass
+class ExpiryConfig:
+    """Warn before HTTPS certificates or domain registrations run out. Empty lists = off."""
+
+    tls_hosts: list[str] = field(default_factory=list)  # "host" or "host:port" (default 443)
+    domains: list[str] = field(default_factory=list)  # registered domains, looked up over RDAP
+    warn_days: list[int] = field(default_factory=lambda: [21, 7])  # one alert per level crossed
+    every_hours: float = 24.0  # RDAP is never asked more than once a day per domain
+    timeout_seconds: float = 10.0
+    failed_lookups_before_alert: int = 3  # retries: TLS after 1 h, RDAP after 6 h
+
+
+TWILIO_ENV = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "TWILIO_TO_NUMBER")
+
+
+@dataclass
+class TwilioCredentials:
+    account_sid: str = field(repr=False)
+    auth_token: str = field(repr=False)
+    from_number: str = field(repr=False)
+    to_number: str = field(repr=False)
+
+
+@dataclass
+class PhoneCallConfig:
+    """Place a voice call when Home Assistant stays down. Needs every TWILIO_* variable set."""
+
+    enabled: bool = True  # kill switch; without all TWILIO_* environment variables it is off anyway
+    trigger_checks: list[str] = field(default_factory=lambda: ["api"])  # all must be failing
+    after_minutes: float = 30.0
+    max_per_day: int = 2  # rolling 24 h, failed attempts included
+    retry_minutes: float = 10.0  # wait after a failed call attempt
+    message: str = "This is the {name} watcher. {name} has been down for {minutes} minutes. Please check it."
+    twilio: TwilioCredentials | None = field(default=None, repr=False)  # from the environment only
+    missing_env: list[str] = field(default_factory=list)
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and self.twilio is not None
+
+
+@dataclass
 class Config:
     home_assistant: HomeAssistantConfig
     checks: dict[str, CheckConfig]
@@ -130,6 +171,8 @@ class Config:
     deadman: DeadmanConfig = field(default_factory=DeadmanConfig)
     power_cycle: PowerCycleConfig = field(default_factory=PowerCycleConfig)
     recovery_command: RecoveryCommandConfig = field(default_factory=RecoveryCommandConfig)
+    expiry: ExpiryConfig = field(default_factory=ExpiryConfig)
+    phone_call: PhoneCallConfig = field(default_factory=PhoneCallConfig)
 
 
 # Defaults for each check. Anything not listed in COMMON_KEYS is check-specific.
@@ -191,6 +234,8 @@ TOP_LEVEL_KEYS = {
     "deadman",
     "power_cycle",
     "recovery_command",
+    "expiry",
+    "phone_call",
 }
 
 
@@ -222,6 +267,7 @@ def _positive(value: Any, where: str, allow_zero: bool = False) -> None:
 def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     if not isinstance(raw, dict):
         raise ConfigError("config file must be a YAML mapping")
+    env = os.environ if env is None else env
     raw = expand_env(raw, env)
     unknown = set(raw) - TOP_LEVEL_KEYS
     if unknown:
@@ -281,6 +327,8 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         deadman=_build(DeadmanConfig, _section(raw, "deadman"), "deadman"),
         power_cycle=_build(PowerCycleConfig, _section(raw, "power_cycle"), "power_cycle"),
         recovery_command=_build(RecoveryCommandConfig, _section(raw, "recovery_command"), "recovery_command"),
+        expiry=_build(ExpiryConfig, _section(raw, "expiry"), "expiry"),
+        phone_call=_phone_call(_section(raw, "phone_call"), env),
     )
     _positive(cfg.interval_seconds, "interval_seconds")
     _positive(cfg.alerts.realert_minutes, "alerts.realert_minutes", allow_zero=True)
@@ -289,6 +337,8 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         raise ConfigError("heartbeat.time must be HH:MM (24-hour, local time)")
     _validate_power(cfg.power_cycle, checks)
     _validate_recovery(cfg.recovery_command, checks)
+    _validate_expiry(cfg.expiry)
+    _validate_phone_call(cfg.phone_call, checks)
     return cfg
 
 
@@ -353,6 +403,93 @@ def _validate_recovery(r: RecoveryCommandConfig, checks: dict[str, CheckConfig])
     _positive(r.cooldown_minutes, "recovery_command.cooldown_minutes", allow_zero=True)
     _positive(r.max_per_day, "recovery_command.max_per_day")
     _positive(r.busy_grace_minutes, "recovery_command.busy_grace_minutes", allow_zero=True)
+
+
+_LABEL = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+_HOST_RE = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")
+_PHONE_RE = re.compile(r"\+[1-9]\d{6,14}")
+
+
+def split_host(entry: str) -> tuple[str, int]:
+    """'example.com' -> ('example.com', 443); 'example.com:8443' -> ('example.com', 8443)."""
+    host, sep, port = entry.rpartition(":")
+    return (host, int(port)) if sep else (entry, 443)
+
+
+def _validate_expiry(e: ExpiryConfig) -> None:
+    for key in ("tls_hosts", "domains"):
+        value = getattr(e, key)
+        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+            raise ConfigError(f"expiry.{key}: must be a list of host names")
+    e.tls_hosts = [h.strip().lower() for h in e.tls_hosts]
+    e.domains = [d.strip().lower().rstrip(".") for d in e.domains]
+    for entry in e.tls_hosts:
+        if "/" in entry:
+            raise ConfigError(f"expiry.tls_hosts: '{entry}' must be a host name, not a URL")
+        try:
+            host, port = split_host(entry)
+        except ValueError:
+            raise ConfigError(f"expiry.tls_hosts: '{entry}' has a bad port") from None
+        if not _HOST_RE.fullmatch(host) or not 0 < port < 65536:
+            raise ConfigError(f"expiry.tls_hosts: '{entry}' is not a valid host[:port]")
+    for d in e.domains:
+        if "." not in d or not _HOST_RE.fullmatch(d):
+            raise ConfigError(f"expiry.domains: '{d}' must be a registered domain such as example.com")
+    days = e.warn_days
+    if (
+        not isinstance(days, list)
+        or not days
+        or not all(isinstance(d, int) and not isinstance(d, bool) and d > 0 for d in days)
+    ):
+        raise ConfigError("expiry.warn_days: must be a non-empty list of whole days > 0, e.g. [21, 7]")
+    e.warn_days = sorted(set(days), reverse=True)
+    _positive(e.every_hours, "expiry.every_hours")
+    if e.every_hours < 1:
+        raise ConfigError("expiry.every_hours: must be at least 1")
+    _positive(e.timeout_seconds, "expiry.timeout_seconds")
+    f = e.failed_lookups_before_alert
+    if not isinstance(f, int) or isinstance(f, bool) or f < 1:
+        raise ConfigError("expiry.failed_lookups_before_alert: must be an integer >= 1")
+
+
+def _phone_call(data: dict[str, Any], env: Any) -> PhoneCallConfig:
+    if {"twilio", "missing_env"} & set(data):
+        raise ConfigError("phone_call: Twilio credentials come from the TWILIO_* environment variables only")
+    pc = _build(PhoneCallConfig, data, "phone_call")
+    values = [(env.get(name) or "").strip() for name in TWILIO_ENV]
+    pc.missing_env = [name for name, v in zip(TWILIO_ENV, values, strict=True) if not v]
+    if not pc.missing_env:
+        pc.twilio = TwilioCredentials(*values)
+    return pc
+
+
+def _validate_phone_call(p: PhoneCallConfig, checks: dict[str, CheckConfig]) -> None:
+    if not p.active or p.twilio is None:
+        return
+    sid = p.twilio.account_sid
+    if not (sid.startswith("AC") and len(sid) == 34):
+        raise ConfigError("TWILIO_ACCOUNT_SID must be the 34-character account SID starting with AC")
+    for name, number in (
+        ("TWILIO_FROM_NUMBER", p.twilio.from_number),
+        ("TWILIO_TO_NUMBER", p.twilio.to_number),
+    ):
+        if not _PHONE_RE.fullmatch(number):
+            raise ConfigError(f"{name} must be in +E.164 form, e.g. +15555550100")
+    if not p.trigger_checks:
+        raise ConfigError("phone_call.trigger_checks: list at least one check")
+    for name in p.trigger_checks:
+        if name not in checks or not checks[name].enabled:
+            raise ConfigError(f"phone_call.trigger_checks: '{name}' is not an enabled check")
+    _positive(p.after_minutes, "phone_call.after_minutes")
+    _positive(p.retry_minutes, "phone_call.retry_minutes")
+    if not isinstance(p.max_per_day, int) or isinstance(p.max_per_day, bool) or p.max_per_day < 1:
+        raise ConfigError("phone_call.max_per_day: must be an integer >= 1")
+    if not isinstance(p.message, str) or not p.message.strip() or len(p.message) > 500:
+        raise ConfigError("phone_call.message: must be 1 to 500 characters")
+    try:
+        p.message.format(name="x", minutes=1)
+    except (KeyError, IndexError, ValueError, AttributeError):
+        raise ConfigError("phone_call.message: only {name} and {minutes} may be used") from None
 
 
 def load_config(path: str | Path, env: dict[str, str] | None = None) -> Config:

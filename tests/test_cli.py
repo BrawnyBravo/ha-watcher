@@ -88,3 +88,45 @@ def test_test_notify(tmp_path, monkeypatch, capsys):
     _patch_watcher(monkeypatch, tmp_path, FakeHA())
     assert cli.main(["--test-notify", "-c", str(p)]) == 0
     assert "Sent to 0 of 0" in capsys.readouterr().out
+
+
+TWILIO_VARS = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "TWILIO_TO_NUMBER")
+
+
+def test_check_config_reports_phone_and_expiry_off(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HA_TOKEN", "x")
+    for k in TWILIO_VARS:
+        monkeypatch.delenv(k, raising=False)
+    p = write_cfg(tmp_path, MINIMAL)
+    assert cli.main(["--check-config", "-c", str(p)]) == 0
+    out = capsys.readouterr().out
+    assert "Phone call: off (no TWILIO_* variables set)" in out
+    assert "Expiry warnings: off" in out
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "secret-not-real")
+    assert cli.main(["--check-config", "-c", str(p)]) == 0
+    out = capsys.readouterr().out
+    assert "missing TWILIO_ACCOUNT_SID, TWILIO_FROM_NUMBER, TWILIO_TO_NUMBER" in out
+    assert "secret-not-real" not in out
+
+
+def test_check_config_reports_phone_and_expiry_on(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HA_TOKEN", "x")
+    values = ["AC" + "0" * 32, "secret-not-real", "+15555550100", "+15555550199"]
+    for k, v in zip(TWILIO_VARS, values, strict=True):
+        monkeypatch.setenv(k, v)
+    p = write_cfg(tmp_path, MINIMAL + "expiry:\n  tls_hosts: [example.com]\n  domains: [example.com]\n")
+    assert cli.main(["--check-config", "-c", str(p)]) == 0
+    out = capsys.readouterr().out
+    assert "Phone call: on, after 30m of api failing, once per outage, max 2/day" in out
+    assert "Expiry warnings: 1 certificate(s), 1 domain(s), at 21/7 days" in out
+    for v in values:
+        assert v not in out
+
+
+def test_test_call_refuses_without_twilio(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HA_TOKEN", "x")
+    for k in TWILIO_VARS:
+        monkeypatch.delenv(k, raising=False)
+    p = write_cfg(tmp_path, MINIMAL)
+    assert cli.main(["--test-call", "-c", str(p)]) == 2
+    assert "Phone call: off" in capsys.readouterr().err
