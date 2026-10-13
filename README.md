@@ -40,8 +40,15 @@ Also:
 - Optional **power cycle** of the HA host through a smart plug (Shelly Gen2+ local RPC, or
   TP-Link Kasa via python-kasa) after N minutes down. **Off by default**, with a cooldown,
   a daily cap, and a hold-off if a backup or update was running just before the outage.
+- **Certificate and domain expiry warnings** for the hosts and domains you list: one alert
+  at 21 days and one at 7 (configurable), one more if it actually expires, and a message
+  when it is renewed. Domain dates come from RDAP, the registries' free public lookup.
+  Off until you list something.
+- Optional **phone call** through Twilio when Home Assistant has been down for 30 minutes
+  (configurable) and has not come back: once per outage, at most twice a day. **Off unless
+  the Twilio environment variables are set**; see "Phone call escalation" below.
 - One YAML file, secrets from environment variables, a JSON state file written atomically,
-  `--check-config`, `--once` and `--test-notify` modes.
+  `--check-config`, `--once`, `--test-notify` and `--test-call` modes.
 
 Three runtime dependencies: `httpx`, `PyYAML`, `websockets`.
 
@@ -141,6 +148,7 @@ ha-watcher -c config.yaml                 run forever
 ha-watcher -c config.yaml --check-config  validate config (and notifier/plug settings), exit 2 on error
 ha-watcher -c config.yaml --once          one full cycle, print each result, exit 1 if anything failed
 ha-watcher -c config.yaml --test-notify   send a test message to every notifier
+ha-watcher -c config.yaml --test-call     place one test phone call (needs the TWILIO_* variables)
 ```
 
 `--once` is a real cycle: it updates the state file and can send alerts, so it also works
@@ -165,7 +173,7 @@ error that names the variable. Unknown keys are errors, so typos are caught.
 | --- | --- | --- |
 | `name` | `Home Assistant` | Used in alert titles. |
 | `interval_seconds` | `60` | Loop interval. |
-| `state_file` | `ha-watcher-state.json` | Debounce counters, alert times, power-cycle and recovery-command history. |
+| `state_file` | `ha-watcher-state.json` | Debounce counters, alert times, power-cycle, recovery-command and phone-call history, expiry dates and warnings sent. |
 
 ### `home_assistant`
 
@@ -271,6 +279,76 @@ notifiers:
 | `max_per_day` | `2` | Cap in any rolling 24 hours. Failed attempts count too. The run history lives in the state file, so restarting the watcher does not reset it. |
 | `busy_grace_minutes` | `0` | If above 0, hold off when a backup or update was seen running within this many minutes (same probe as the power cycle). Off by default: a restart is not dangerous the way cutting power is. |
 | `dry_run` | `false` | Report what would happen without running anything. |
+
+### `expiry`
+
+Off until `tls_hosts` or `domains` lists something. Runs whether or not Home Assistant is up.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `tls_hosts` | `[]` | Host names whose HTTPS certificate to watch, `host` or `host:port` (443). The handshake checks the chain and name like a browser, so a self-signed or wrong-name certificate is reported as "cannot check", not as a date. An expired certificate is reported as expired. |
+| `domains` | `[]` | Registered domains (`example.com`, not `www.example.com`) whose registration to watch over RDAP. |
+| `warn_days` | `[21, 7]` | One alert when fewer than this many days are left, per level, plus one when it expires. A first check that is already inside both levels sends one alert, not two. A later expiry date (a renewal) sends a "renewed" message and re-arms the levels. |
+| `every_hours` | `24` | How often each item is looked up. A good RDAP answer is kept for at least a day regardless. |
+| `timeout_seconds` | `10` | Per lookup. |
+| `failed_lookups_before_alert` | `3` | Consecutive failed lookups before one "cannot check expiry" message, sent once and cleared when a lookup works. Failed certificate lookups retry after 1 hour, failed RDAP lookups after 6 hours. |
+
+How the domain lookup treats the public service: the IANA RDAP bootstrap file
+(`data.iana.org/rdap/dns.json`, RFC 9224) names the registry server for each top-level
+domain; it is fetched at most once a week and only the entries for your domains are kept.
+Each domain then costs one request a day to its registry, at most one RDAP request goes
+out per watch loop, requests carry a `ha-watcher/<version>` user agent, and a `403` or
+`429` stops all RDAP lookups for a day (or for the server's `Retry-After`, if longer). No
+account or key is needed. Some registries (several country-code domains) publish no
+expiry date over RDAP; those report "cannot check" and should be removed from the list.
+
+### `phone_call`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | A kill switch. Calls also need all four `TWILIO_*` environment variables; without them this is off. |
+| `trigger_checks` | `[api]` | Checks that must **all** be failing. Nothing else (backups, certificates, entities) ever calls. |
+| `after_minutes` | `30` | Continuous failure before calling. Keep it above the recovery command and power cycle delays so those get their chance first. |
+| `max_per_day` | `2` | Cap in any rolling 24 hours. Failed attempts count. When the cap is reached the watcher logs it once and stays quiet; normal alerts carry on. |
+| `retry_minutes` | `10` | Wait after a failed call attempt before trying again (still within the cap). |
+| `message` | see example | What the call says, twice. `{name}` and `{minutes}` are filled in. |
+
+The account and numbers come from the environment only (`TWILIO_ACCOUNT_SID`,
+`TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `TWILIO_TO_NUMBER`); a `twilio` key in the file
+is an error. `--check-config` says whether calls are on, or which variables are missing,
+without printing their values.
+
+## Phone call escalation
+
+For the one problem worth waking up for: Home Assistant down and not coming back. One
+outage gives one call. The outage is identified by when it started, so a long outage is
+never called twice, while a new outage after a recovery may call again (within
+`max_per_day`). Each call is followed by a normal notification saying it was placed, or
+that it failed and why (HTTP status and Twilio error number only).
+
+Setting it up (a few minutes; Twilio charges per call, so check their current prices):
+
+1. Create a Twilio account. A trial account can only call numbers you have verified in
+   the console, which is enough for calling yourself.
+2. Get a phone number with voice capability in the console. That is `TWILIO_FROM_NUMBER`.
+3. Copy the **Account SID** (starts with `AC`) and **Auth Token** from the console's
+   account dashboard.
+4. Add them to the watcher's environment file (the same root-owned file as `HA_TOKEN`),
+   numbers in `+E.164` form:
+
+   ```
+   TWILIO_ACCOUNT_SID=AC...
+   TWILIO_AUTH_TOKEN=...
+   TWILIO_FROM_NUMBER=+15555550100
+   TWILIO_TO_NUMBER=+15555550199
+   ```
+
+5. Run `--check-config` (it should say `Phone call: on`), then `--test-call` once to hear
+   it, then restart the service.
+
+To switch calls off again, set `phone_call.enabled: false` or remove the variables. The
+call uses Twilio's REST API directly (`POST .../Accounts/<sid>/Calls.json` with inline
+TwiML); no Twilio library is installed and nothing is hosted on your side.
 
 ## Restarting Home Assistant Core automatically
 
@@ -380,6 +458,8 @@ default, capped, and announced every time.
 - **The recovery command** runs with the watcher's own rights, with no shell, and its output
   is trimmed to one line in messages. For SSH, use a dedicated key with a forced command
   (above) so that a stolen key can only restart Home Assistant.
+- **Twilio.** The auth token and both phone numbers stay in the environment; they are never
+  logged, printed by `--check-config`, or put in a notification.
 - **The plug.** A Shelly with no password lets anyone on your LAN switch it. Set one.
 
 ## Tested on
@@ -402,6 +482,9 @@ spare the SD card; ha-watcher itself only writes its small state file.
 - The busy hold-off only knows what HA reported before it went down (see above).
 - The `ping` host method shells out to the system `ping`; the Docker image includes it.
 - Alerts that fail to deliver are logged, not queued for later.
+- A phone call needs the watcher's own internet connection, like every other alert.
+- Expiry checks run inside the watch loop: an unreachable host can delay one loop by up to
+  `expiry.timeout_seconds`, at most once an hour.
 - Tested with mocked HTTP and WebSocket traffic, plus one real local WebSocket server. It has
   not yet been run against every HA install type: reports welcome.
 

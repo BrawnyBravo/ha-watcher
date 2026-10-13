@@ -115,3 +115,21 @@ recovery_command:              # soft fix before the plug; OFF by default. See R
   max_per_day: 2
   busy_grace_minutes: 0        # >0: hold off if a backup/update was seen running this recently
   dry_run: false
+
+expiry:                        # warn before certificates or domains run out; empty = off
+  tls_hosts: []                # e.g. [ha.example.com, example.com:8443] (port 443 if omitted)
+  domains: []                  # e.g. [example.com]: the registered domain, looked up over RDAP
+  warn_days: [21, 7]           # one alert per level crossed, one more when it expires
+  every_hours: 24              # RDAP is asked at most once a day per domain anyway
+  timeout_seconds: 10
+  failed_lookups_before_alert: 3
+
+phone_call:                    # voice call through Twilio when HA stays down. See README.
+  # OFF unless TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER and
+  # TWILIO_TO_NUMBER are all set in the environment. Never put them in this file.
+  enabled: true                # false = off even with the variables set
+  trigger_checks: [api]        # all of these must be failing
+  after_minutes: 30            # keep above recovery_command / power_cycle after_minutes
+  max_per_day: 2               # rolling 24 h, failed attempts included
+  retry_minutes: 10            # wait after a failed call attempt
+  message: "This is the {name} watcher. {name} has been down for {minutes} minutes. Please check it."

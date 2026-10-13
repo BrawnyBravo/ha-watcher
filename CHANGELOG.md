@@ -14,6 +14,17 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- `expiry`: warnings before an HTTPS certificate (`tls_hosts`) or a domain registration
+  (`domains`, looked up over public RDAP through the IANA bootstrap file, no key) runs out.
+  One alert per `warn_days` level crossed (default 21 and 7), one more when it expires, a
+  "renewed" message when the date moves later, and one "cannot check" message after
+  repeated failed lookups. RDAP: at most one request per loop, answers kept a day, a 403 or
+  429 pauses lookups for a day. Empty by default.
+- `phone_call`: a Twilio voice call when the `trigger_checks` (default `api`) have been
+  failing for `after_minutes` (default 30). Once per outage, `max_per_day` cap (default 2,
+  failed attempts included), retry after a failed attempt, a notification after each call.
+  Off unless all four `TWILIO_*` environment variables are set; `enabled: false` is a kill
+  switch. `--check-config` reports it; `--test-call` places one test call.
 - Optional `recovery_command` action: runs a configured command (for example `ha core
   restart` through an SSH key restricted by a forced command) once Home Assistant has been
   down for `after_minutes` while the `only_if_passing` checks (typically `host`) still pass.
