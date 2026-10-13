@@ -49,7 +49,7 @@ def expand_env(value: Any, env: dict[str, str] | None = None, path: str = "") ->
 @dataclass
 class HomeAssistantConfig:
     url: str
-    token: str
+    token: str = field(repr=False)
     verify_ssl: bool = True
     ca_file: str | None = None  # CA bundle for a self-signed certificate
     timeout_seconds: float = 10.0
@@ -91,7 +91,7 @@ class PowerCycleConfig:
     host: str = ""
     switch_id: int = 0
     username: str | None = None
-    password: str | None = None
+    password: str | None = field(default=None, repr=False)
     after_minutes: float = 10.0
     off_seconds: int = 15
     cooldown_minutes: float = 60.0
@@ -162,7 +162,7 @@ class PhoneCallConfig:
 class Config:
     home_assistant: HomeAssistantConfig
     checks: dict[str, CheckConfig]
-    notifiers: list[dict[str, Any]]
+    notifiers: list[dict[str, Any]] = field(repr=False)  # may hold tokens and passwords
     interval_seconds: int = 60
     state_file: str = "ha-watcher-state.json"
     name: str = "Home Assistant"
@@ -246,11 +246,34 @@ def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+_TRUE = {"true", "yes", "on", "1"}
+_FALSE = {"false", "no", "off", "0", ""}
+
+
+def _bool(value: Any, where: str) -> bool:
+    """A real boolean. ``${VAR}`` always expands to a string, so "false" must mean False."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in _TRUE | _FALSE:
+        return value.strip().lower() in _TRUE
+    raise ConfigError(f"{where}: must be true or false, got {value!r}")
+
+
+def _str_list(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ConfigError(f"{where}: must be a list of names, e.g. [a, b]")
+    return value
+
+
 def _build(cls: type, data: dict[str, Any], where: str) -> Any:
     allowed = set(cls.__dataclass_fields__)
     unknown = set(data) - allowed
     if unknown:
         raise ConfigError(f"{where}: unknown key(s) {', '.join(sorted(unknown))}")
+    data = dict(data)
+    for name, f in cls.__dataclass_fields__.items():
+        if name in data and isinstance(f.default, bool):
+            data[name] = _bool(data[name], f"{where}.{name}")
     try:
         return cls(**data)
     except TypeError as exc:  # missing required field
@@ -259,9 +282,20 @@ def _build(cls: type, data: dict[str, Any], where: str) -> Any:
 
 def _positive(value: Any, where: str, allow_zero: bool = False) -> None:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ConfigError(f"{where}: must be a number")
+        raise ConfigError(f"{where}: must be a number, got {value!r}")
     if value < 0 or (value == 0 and not allow_zero):
         raise ConfigError(f"{where}: must be {'>= 0' if allow_zero else '> 0'}")
+
+
+def _whole(value: Any, where: str, low: int, high: int | None = None) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < low or (high and value > high):
+        span = f"from {low} to {high}" if high else f">= {low}"
+        raise ConfigError(f"{where}: must be a whole number {span}, got {value!r}")
+
+
+def _text(value: Any, where: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{where}: must be a non-empty string")
 
 
 def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
@@ -279,9 +313,14 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     if not ha_raw.get("token"):
         raise ConfigError("home_assistant.token is required (use ${HA_TOKEN})")
     ha = _build(HomeAssistantConfig, ha_raw, "home_assistant")
-    ha.url = ha.url.rstrip("/")
+    _text(ha.url, "home_assistant.url")
+    _text(ha.token, "home_assistant.token")
+    ha.url = ha.url.strip().rstrip("/")
     if not ha.url.startswith(("http://", "https://")):
         raise ConfigError("home_assistant.url must start with http:// or https://")
+    _positive(ha.timeout_seconds, "home_assistant.timeout_seconds")
+    if ha.ca_file is not None and not Path(ha.ca_file).is_file():
+        raise ConfigError(f"home_assistant.ca_file: {ha.ca_file} is not a readable file")
 
     checks: dict[str, CheckConfig] = {}
     checks_raw = _section(raw, "checks")
@@ -296,8 +335,13 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         extra = set(merged) - set(defaults) - COMMON_KEYS
         if extra:
             raise ConfigError(f"checks.{name}: unknown key(s) {', '.join(sorted(extra))}")
+        for key, default in defaults.items():
+            if isinstance(default, bool):
+                merged[key] = _bool(merged[key], f"checks.{name}.{key}")
+            elif isinstance(default, list):
+                _str_list(merged[key], f"checks.{name}.{key}")
         fba = merged["failures_before_alert"]
-        if not isinstance(fba, int) or fba < 1:
+        if not isinstance(fba, int) or isinstance(fba, bool) or fba < 1:
             raise ConfigError(f"checks.{name}.failures_before_alert: must be an integer >= 1")
         _positive(merged.get("every_seconds", 0), f"checks.{name}.every_seconds", allow_zero=True)
         checks[name] = CheckConfig(
@@ -331,12 +375,25 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         phone_call=_phone_call(_section(raw, "phone_call"), env),
     )
     _positive(cfg.interval_seconds, "interval_seconds")
+    _text(cfg.name, "name")
+    _text(cfg.state_file, "state_file")
     _positive(cfg.alerts.realert_minutes, "alerts.realert_minutes", allow_zero=True)
-    _positive(cfg.alerts.max_per_hour, "alerts.max_per_hour")
+    _whole(cfg.alerts.max_per_hour, "alerts.max_per_hour", 1)
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(cfg.heartbeat.time)):
         raise ConfigError("heartbeat.time must be HH:MM (24-hour, local time)")
+    _validate_deadman(cfg.deadman)
     _validate_power(cfg.power_cycle, checks)
     _validate_recovery(cfg.recovery_command, checks)
+    if (
+        cfg.power_cycle.enabled
+        and cfg.recovery_command.enabled
+        and cfg.power_cycle.after_minutes <= cfg.recovery_command.after_minutes
+    ):
+        # The power cycle would cut the machine a loop after the gentle restart was sent.
+        raise ConfigError(
+            "power_cycle.after_minutes must be greater than recovery_command.after_minutes "
+            "(e.g. 10 and 30), so a restart gets time to work before the power is cut"
+        )
     _validate_expiry(cfg.expiry)
     _validate_phone_call(cfg.phone_call, checks)
     return cfg
@@ -360,6 +417,16 @@ def _validate_checks(checks: dict[str, CheckConfig]) -> None:
     if h.options["method"] not in ("tcp", "ping"):
         raise ConfigError("checks.host.method must be 'tcp' or 'ping'")
     _positive(checks["api"].options["max_response_ms"], "checks.api.max_response_ms")
+    _positive(m.options["max_percent"], "checks.memory.max_percent")
+    _whole(h.options["port"], "checks.host.port", 1, 65535)
+    _positive(h.options["timeout_seconds"], "checks.host.timeout_seconds")
+    _text(b.options["sensor_entity"], "checks.backup.sensor_entity")
+
+
+def _validate_deadman(d: DeadmanConfig) -> None:
+    if d.url and not (isinstance(d.url, str) and d.url.startswith(("http://", "https://"))):
+        raise ConfigError("deadman.url must start with http:// or https:// (or be empty for off)")
+    _positive(d.every_seconds, "deadman.every_seconds")
 
 
 def _validate_power(p: PowerCycleConfig, checks: dict[str, CheckConfig]) -> None:
@@ -367,8 +434,11 @@ def _validate_power(p: PowerCycleConfig, checks: dict[str, CheckConfig]) -> None
         return
     if p.driver not in ("shelly", "kasa"):
         raise ConfigError("power_cycle.driver must be 'shelly' or 'kasa'")
-    if not p.host:
+    if not p.host or not isinstance(p.host, str):
         raise ConfigError("power_cycle.host is required when power_cycle is enabled")
+    _whole(p.switch_id, "power_cycle.switch_id", 0)
+    if not _str_list(p.trigger_checks, "power_cycle.trigger_checks"):
+        raise ConfigError("power_cycle.trigger_checks: list at least one check")
     for name in p.trigger_checks:
         if name not in checks or not checks[name].enabled:
             raise ConfigError(f"power_cycle.trigger_checks: '{name}' is not an enabled check")
@@ -387,8 +457,9 @@ def _validate_recovery(r: RecoveryCommandConfig, checks: dict[str, CheckConfig])
         or not all(isinstance(a, str) and a for a in r.command)
     ):
         raise ConfigError("recovery_command.command must be a non-empty list of strings (argv, no shell)")
-    if not r.trigger_checks:
+    if not _str_list(r.trigger_checks, "recovery_command.trigger_checks"):
         raise ConfigError("recovery_command.trigger_checks: list at least one check")
+    _str_list(r.only_if_passing, "recovery_command.only_if_passing")
     for key in ("trigger_checks", "only_if_passing"):
         for name in getattr(r, key):
             if name not in checks or not checks[name].enabled:
@@ -475,7 +546,7 @@ def _validate_phone_call(p: PhoneCallConfig, checks: dict[str, CheckConfig]) -> 
     ):
         if not _PHONE_RE.fullmatch(number):
             raise ConfigError(f"{name} must be in +E.164 form, e.g. +15555550100")
-    if not p.trigger_checks:
+    if not _str_list(p.trigger_checks, "phone_call.trigger_checks"):
         raise ConfigError("phone_call.trigger_checks: list at least one check")
     for name in p.trigger_checks:
         if name not in checks or not checks[name].enabled:

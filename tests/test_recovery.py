@@ -167,12 +167,23 @@ def test_same_tick_never_does_both(tmp_path):
         tmp_path,
         runner,
         plug=plug,
-        power_cycle={"enabled": True, "host": "192.0.2.20", "after_minutes": 10, "trigger_checks": ["api"]},
+        power_cycle={"enabled": True, "host": "192.0.2.20", "after_minutes": 20, "trigger_checks": ["api"]},
     )
+    # The config check refuses equal delays; force them equal to prove the engine's own guard.
+    w.cfg.power_cycle.after_minutes = 10
     loop(w, 0, 11)
     assert len(runner.calls) == 1 and plug.cycles == 0
     w.run_once(NOW + 11 * M)
     assert plug.cycles == 1
+
+
+def test_equal_delays_are_refused_by_the_config_check():
+    with pytest.raises(ConfigError, match="greater than recovery_command.after_minutes"):
+        make_cfg(
+            checks=HOST,
+            recovery_command=RC,
+            power_cycle={"enabled": True, "host": "192.0.2.20", "after_minutes": 10},
+        )
 
 
 def test_busy_hold_off_when_enabled(tmp_path):

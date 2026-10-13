@@ -24,6 +24,7 @@ def empty_state() -> dict[str, Any]:
         "suppressed": 0,
         "heartbeat_last": None,
         "deadman_last": None,
+        "last_loop": None,
         "power": {"cycles": [], "busy_seen": None, "busy_reason": None, "last_decision": None},
         "recovery": {"runs": [], "last_decision": None},
         "expiry": {"items": {}, "rdap_servers": {}, "rdap_backoff_until": None},
@@ -42,11 +43,84 @@ def load_state(path: str | Path) -> dict[str, Any]:
     except (OSError, ValueError) as exc:
         log.warning("state file %s unreadable (%s); starting fresh", p, type(exc).__name__)
         return empty_state()
+    return _sanitize(data)
+
+
+CHECK_KEYS = {"check": str, "ok": bool, "failures": int, "alerting": bool, "message": str}
+TIME_LISTS = {("alert_times",), ("power", "cycles"), ("recovery", "runs"), ("phone", "calls")}
+TIMES = {
+    ("deadman_last",),
+    ("last_loop",),
+    ("power", "busy_seen"),
+    ("phone", "called_outage"),
+    ("phone", "last_attempt"),
+    ("expiry", "rdap_backoff_until"),
+}
+
+
+def _sanitize(data: dict[str, Any]) -> dict[str, Any]:
+    """Fill missing parts from the defaults and reset parts of the wrong type.
+
+    The file is ours, but it may come from an older or newer version or be edited by
+    hand; a bad value must cost that one value, never crash every loop.
+    """
     base = empty_state()
-    base.update(data)
-    for key in ("power", "recovery", "expiry", "phone"):
-        base[key] = {**empty_state()[key], **(data.get(key) or {})}
+    for key, default in base.items():
+        if key not in data or key == "version":
+            continue
+        value = data[key]
+        if isinstance(default, dict):
+            if not isinstance(value, dict):
+                log.warning("state file: %s has the wrong type; reset", key)
+                continue
+            if key in ("checks", "last_run"):
+                base[key] = value
+            else:
+                base[key] = {**default, **{k: v for k, v in value.items() if _same_type(default.get(k), v)}}
+        elif _same_type(default, value):
+            base[key] = value
+        else:
+            log.warning("state file: %s has the wrong type; reset", key)
+    base["checks"] = {
+        k: v
+        for k, v in base["checks"].items()
+        if isinstance(v, dict)
+        and all(isinstance(v.get(f), t) for f, t in CHECK_KEYS.items())
+        and _time_or_none(v.get("first_failure"))
+        and _time_or_none(v.get("last_alert"))
+        and _time_or_none(v.get("held_since"))
+    }
+    base["last_run"] = {k: v for k, v in base["last_run"].items() if _aware(v)}
+    for path in TIME_LISTS:
+        holder = base if len(path) == 1 else base[path[0]]
+        holder[path[-1]] = [t for t in holder[path[-1]] if _aware(t)]
+    for path in TIMES:
+        holder = base if len(path) == 1 else base[path[0]]
+        if not _time_or_none(holder[path[-1]]):
+            holder[path[-1]] = None
     return base
+
+
+def _same_type(default: Any, value: Any) -> bool:
+    if default is None:
+        return True  # optional values: a timestamp, a reason, ...
+    if isinstance(default, bool) or isinstance(value, bool):
+        return isinstance(default, bool) and isinstance(value, bool)
+    return isinstance(value, type(default))
+
+
+def _aware(value: Any) -> bool:
+    """A timezone-aware ISO timestamp, as this module writes them."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return datetime.fromisoformat(value).tzinfo is not None
+    except ValueError:
+        return False
+
+
+def _time_or_none(value: Any) -> bool:
+    return value is None or _aware(value)
 
 
 def save_state(path: str | Path, state: dict[str, Any]) -> None:

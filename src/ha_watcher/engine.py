@@ -24,6 +24,9 @@ log = logging.getLogger(__name__)
 
 STARTING_STATES = {"NOT_RUNNING", "STARTING"}
 STARTUP_HOLD = timedelta(minutes=15)
+# Wall clock and monotonic clock may drift apart this much between loops before the
+# watcher decides the system clock was changed (e.g. NTP setting a clock-less Pi).
+CLOCK_SLACK = timedelta(minutes=2)
 
 
 def utcnow() -> datetime:
@@ -72,22 +75,40 @@ class Watcher:
             cfg.expiry, self.state["expiry"], http, notify, cfg.name, local_tz, cert_lookup
         )
         self.phone = PhoneEscalation(cfg.phone_call, self.state["phone"], http, notify, cfg.name, caller)
+        self.monotonic = time.monotonic
+        self._last_tick: tuple[datetime, float] | None = None
+        self._first_loop = True
 
     # ------------------------------------------------------------------ public
     def run_once(self, now: datetime | None = None) -> list[Result]:
-        now = now or utcnow()
+        if now is None:
+            now = utcnow()
+            self._watch_clock(now)
+        self._check_gap(now)
+        self.state["last_loop"] = ts(now)
         results, ran = self._run_checks(now)
         alerts, recoveries = self._update(results, ran, now)
-        self._deliver(alerts, recoveries, now)
-        self._busy_probe(results, now)
-        if not self._maybe_recovery_command(now):
-            self._maybe_power_cycle(now)
+        # Each step is isolated: a bug or an odd reply in one must not skip the others,
+        # least of all the dead-man ping and the state save at the end.
+        self._step("delivery", self._deliver, alerts, recoveries, now)
+        self._step("busy probe", self._busy_probe, results, now)
+        self._step("recovery actions", self._recovery_actions, now)
         self.phone.run(now, self._down_since(self.cfg.phone_call.trigger_checks))
         self.expiry.run(now)
-        self._heartbeat(now)
-        self._deadman(now)
+        self._step("heartbeat", self._heartbeat, now)
+        self._step("dead-man ping", self._deadman, now)
         save_state(self.state_path, self.state)
         return results
+
+    def _step(self, name: str, fn: Callable[..., Any], *args: Any) -> None:
+        try:
+            fn(*args)
+        except Exception:  # noqa: BLE001 - the watcher must keep watching
+            log.exception("%s failed", name)
+
+    def _recovery_actions(self, now: datetime) -> None:
+        if not self._maybe_recovery_command(now):
+            self._maybe_power_cycle(now)
 
     def run_forever(self, sleep: Callable[[float], None] = time.sleep) -> None:
         log.info("watching %s every %ss", self.cfg.home_assistant.url, self.cfg.interval_seconds)
@@ -99,6 +120,53 @@ class Watcher:
             except Exception:  # noqa: BLE001 - the watcher must keep watching
                 log.exception("watch cycle failed")
             sleep(max(1.0, self.cfg.interval_seconds - (time.monotonic() - start)))
+
+    # ------------------------------------------------------------------- clock
+    def _watch_clock(self, now: datetime) -> None:
+        """Notice the system clock being set (wall time moving unlike monotonic time)."""
+        mono = self.monotonic()
+        if self._last_tick is not None:
+            wall0, mono0 = self._last_tick
+            drift = (now - wall0).total_seconds() - (mono - mono0)
+            if abs(drift) > CLOCK_SLACK.total_seconds():
+                self._restart_outage_clock(now, f"the system clock jumped by {fmt_age(abs(drift))}")
+        self._last_tick = (now, mono)
+
+    def _check_gap(self, now: datetime) -> None:
+        """On the first loop, distrust outage times older than a normal gap between loops."""
+        if not self._first_loop:
+            return
+        self._first_loop = False
+        last = parse(self.state["last_loop"])
+        limit = max(timedelta(minutes=5), timedelta(seconds=3 * self.cfg.interval_seconds))
+        if last and not (-CLOCK_SLACK < now - last < limit):
+            self._restart_outage_clock(now, "the watcher was not running for a while")
+
+    def _restart_outage_clock(self, now: datetime, why: str) -> None:
+        """Count open outages from now, so no recovery action fires on time nobody watched.
+
+        Timestamps in the future (the clock went back) are pulled to now, which keeps
+        every count and cap but stops them from blocking for the size of the jump.
+        """
+        phone = self.state["phone"]
+        old_down = self._down_since(self.cfg.phone_call.trigger_checks)
+        stamp = ts(now)
+        for st in self.state["checks"].values():
+            if not st["ok"] and st["first_failure"]:
+                st["first_failure"] = stamp
+            for key in ("last_alert", "held_since"):
+                if st.get(key) and parse(st[key]) > now:
+                    st[key] = stamp
+        if old_down is not None and phone["called_outage"] == ts(old_down):
+            phone["called_outage"] = ts(self._down_since(self.cfg.phone_call.trigger_checks))
+        for holder, key in (
+            (self.state, "alert_times"),
+            (self.state["power"], "cycles"),
+            (self.state["recovery"], "runs"),
+            (phone, "calls"),
+        ):
+            holder[key] = [t if parse(t) <= now else stamp for t in holder[key]]
+        log.warning("%s; outage timers restart now so recovery actions wait their full delay", why)
 
     # ------------------------------------------------------------------ checks
     def _run_checks(self, now: datetime) -> tuple[list[Result], set[str]]:
@@ -136,9 +204,12 @@ class Watcher:
         return bool(st and not st["ok"])
 
     # ---------------------------------------------------------- debounce logic
-    def _update(self, results: list[Result], ran: set[str], now: datetime) -> tuple[list[str], list[str]]:
+    def _update(
+        self, results: list[Result], ran: set[str], now: datetime
+    ) -> tuple[list[tuple[str, str, str | None]], list[str]]:
+        """Debounce the results. Alerts come back as (key, text, previous last_alert)."""
         checks = self.state["checks"]
-        alerts: list[str] = []
+        alerts: list[tuple[str, str, str | None]] = []
         recoveries: list[str] = []
         realert = timedelta(minutes=self.cfg.alerts.realert_minutes)
         seen: set[str] = set()
@@ -188,11 +259,13 @@ class Watcher:
             if not st["alerting"] and st["failures"] >= need:
                 st["alerting"] = True
                 st["last_alert"] = ts(now)
-                alerts.append(r.message)
+                alerts.append((r.key, r.message, None))
             elif st["alerting"] and realert and now - parse(st["last_alert"]) >= realert:
                 first = parse(st["first_failure"])
+                previous = st["last_alert"]
                 st["last_alert"] = ts(now)
-                alerts.append(f"Still failing for {fmt_age((now - first).total_seconds())}: {r.message}")
+                text = f"Still failing for {fmt_age((now - first).total_seconds())}: {r.message}"
+                alerts.append((r.key, text, previous))
 
         # A key that a check stopped reporting (e.g. a "cannot query" error that cleared,
         # or an entity removed from the config) counts as resolved.
@@ -201,9 +274,13 @@ class Watcher:
             if st["alerting"]:
                 recoveries.append(f"Resolved: {st['message']}")
         # Forget state for checks that are no longer enabled.
-        for key in [k for k, v in checks.items() if not self.cfg.checks[v["check"]].enabled]:
+        for key in [k for k, v in checks.items() if not self._enabled(v["check"])]:
             checks.pop(key)
         return alerts, recoveries
+
+    def _enabled(self, check: str) -> bool:
+        c = self.cfg.checks.get(check)  # state from another version may name an unknown check
+        return bool(c and c.enabled)
 
     # ---------------------------------------------------------------- delivery
     def _rate_ok(self, now: datetime) -> bool:
@@ -213,23 +290,39 @@ class Watcher:
         return len(times) < self.cfg.alerts.max_per_hour
 
     def _send(self, msg: Message, now: datetime, bypass_limit: bool = False) -> bool:
+        """Send to every notifier. False if held back by the rate limit or nothing got through."""
         if not bypass_limit and not self._rate_ok(now):
             self.state["suppressed"] += 1
             log.warning("rate limit reached; suppressed: %s", msg.title)
             return False
-        if self.state["suppressed"]:
-            msg.body += f"\n\n({self.state['suppressed']} earlier message(s) suppressed by the rate limit)"
-            self.state["suppressed"] = 0
-        self.state["alert_times"].append(ts(now))
+        suppressed = self.state["suppressed"]
+        if suppressed:
+            msg.body += f"\n\n({suppressed} earlier message(s) suppressed by the rate limit)"
         log.info("notify [%s] %s: %s", msg.severity, msg.title, msg.body.replace("\n", " | "))
-        send_all(self.notifiers, msg)
+        if self.notifiers and not send_all(self.notifiers, msg):
+            log.error("no notifier delivered: %s", msg.title)
+            return False
+        self.state["suppressed"] = 0
+        self.state["alert_times"].append(ts(now))
         return True
 
-    def _deliver(self, alerts: list[str], recoveries: list[str], now: datetime) -> None:
+    def _deliver(
+        self, alerts: list[tuple[str, str, str | None]], recoveries: list[str], now: datetime
+    ) -> None:
         name = self.cfg.name
         if alerts:
             title = f"{name}: problem" if len(alerts) == 1 else f"{name}: {len(alerts)} problems"
-            self._send(Message(title, "\n".join(f"- {a}" for a in alerts), "alert"), now)
+            body = "\n".join(f"- {text}" for _, text, _ in alerts)
+            if not self._send(Message(title, body, "alert"), now):
+                # Not delivered: undo, so it goes out on a later loop instead of being lost.
+                for key, _, previous in alerts:
+                    st = self.state["checks"].get(key)
+                    if st is None:
+                        continue
+                    if previous is None:
+                        st.update(alerting=False, last_alert=None)
+                    else:
+                        st["last_alert"] = previous
         if recoveries:
             # Recoveries always go out: they close an alert someone is acting on.
             self._send(
@@ -288,19 +381,21 @@ class Watcher:
             if changed and decision.reason.startswith(("held off", "daily cap", "cooldown")):
                 log.warning("power cycle not done: %s", decision.reason)
             return
+        if not pc.dry_run:
+            # Count the attempt before touching the plug, failed or not, and save it, so
+            # neither a broken plug nor a crash mid-cycle can lead to cycling every loop.
+            cycles.append(now)
+            pstate["cycles"] = [ts(c) for c in cycles]
+            save_state(self.state_path, self.state)
         try:
             outcome = power.run_cycle(self.driver, pc)
-            if not pc.dry_run:
-                cycles.append(now)
-            pstate["cycles"] = [ts(c) for c in cycles]
-            body = f"{self.cfg.name} {decision.reason}: {outcome}."
-            self._send(Message(f"{self.cfg.name}: power cycle", body, "alert"), now, bypass_limit=True)
         except power.PowerError as exc:
-            cycles.append(now)  # count failed attempts too, so a broken plug is not hammered
-            pstate["cycles"] = [ts(c) for c in cycles]
             self._send(
                 Message(f"{self.cfg.name}: power cycle FAILED", str(exc), "alert"), now, bypass_limit=True
             )
+            return
+        body = f"{self.cfg.name} {decision.reason}: {outcome}."
+        self._send(Message(f"{self.cfg.name}: power cycle", body, "alert"), now, bypass_limit=True)
 
     # --------------------------------------------------------- recovery command
     def _maybe_recovery_command(self, now: datetime) -> bool:
@@ -399,5 +494,5 @@ class Watcher:
         try:
             self.http.get(url, timeout=10).raise_for_status()
             self.state["deadman_last"] = ts(now)
-        except httpx.HTTPError as exc:
+        except Exception as exc:  # noqa: BLE001 - log only the type: the URL is a secret
             log.warning("dead-man ping failed: %s", type(exc).__name__)

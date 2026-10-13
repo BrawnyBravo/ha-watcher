@@ -398,3 +398,151 @@ def test_core_not_running_without_an_api_outage_still_alerts(tmp_path):
     w, inbox, _ = watcher(tmp_path, fake, checks={"backup": {"enabled": False}})
     run(w, fake, 4)
     assert len(inbox.msgs) == 1 and "NOT_RUNNING" in inbox.msgs[0].body
+
+
+# ------------------------------------------------------------------ hardening
+def test_state_from_an_unknown_check_does_not_break_the_loop(tmp_path):
+    # State written by another version (a check that no longer exists) used to raise
+    # KeyError on every loop, so the watcher never alerted again.
+    st = {
+        "version": 1,
+        "checks": {
+            "gone": {
+                "check": "gone",
+                "ok": False,
+                "failures": 3,
+                "alerting": True,
+                "first_failure": NOW.isoformat(),
+                "last_alert": NOW.isoformat(),
+                "message": "old",
+            }
+        },
+    }
+    (tmp_path / "state.json").write_text(json.dumps(st), encoding="utf-8")
+    fake = FakeHA(API_DOWN)
+    w, inbox, _ = watcher(tmp_path, fake)
+    run(w, fake, 3)
+    assert len(inbox.msgs) == 1 and "API unreachable" in inbox.msgs[0].body
+    assert "gone" not in w.state["checks"]
+
+
+def test_rate_limited_alert_is_delayed_not_lost(tmp_path):
+    fake = FakeHA()
+    w, inbox, _ = watcher(
+        tmp_path,
+        fake,
+        checks={"core": {"failures_before_alert": 1}},
+        alerts={"realert_minutes": 0, "max_per_hour": 1},
+    )
+    w.state["alert_times"] = [(NOW - 30 * M).isoformat()]  # the hour's budget is used up
+    fake.routes["/api/config"] = (200, {"state": "RUNNING", "safe_mode": True})
+    for i in range(30):
+        w.run_once(NOW + i * M)
+    assert inbox.msgs == []
+    w.run_once(NOW + 31 * M)  # the earlier alert is now over an hour old
+    assert len(inbox.msgs) == 1 and "safe mode" in inbox.msgs[0].body
+    w.run_once(NOW + 32 * M)
+    assert len(inbox.msgs) == 1
+
+
+def test_alert_retried_when_every_notifier_failed(tmp_path):
+    class Down(Notifier):
+        name = "down"
+
+        def __init__(self):
+            self.fail, self.got = True, []
+
+        def send(self, msg):
+            if self.fail:
+                raise httpx.ConnectError("offline")
+            self.got.append(msg)
+
+    fake = FakeHA(API_DOWN)
+    w, _, _ = watcher(tmp_path, fake, alerts={"realert_minutes": 0})
+    down = Down()
+    w.notifiers = [down]
+    run(w, fake, 5)  # alert due at minute 2, but delivery fails
+    assert down.got == [] and w.state["alert_times"] == []
+    down.fail = False
+    w.run_once(NOW + 5 * M)
+    assert len(down.got) == 1 and "API unreachable" in down.got[0].body
+    w.run_once(NOW + 6 * M)
+    assert len(down.got) == 1
+
+
+def test_one_crashing_step_does_not_skip_the_dead_man_or_the_save(tmp_path, monkeypatch):
+    w, _, pings = watcher(tmp_path, deadman={"url": "https://hc-ping.example/abc"})
+
+    def boom(now):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(w, "_heartbeat", boom)
+    w.run_once(NOW)
+    assert pings.urls == ["https://hc-ping.example/abc"]
+    assert json.loads((tmp_path / "state.json").read_text())["last_run"]["api"] == NOW.isoformat()
+
+
+def test_power_cycle_driver_bug_is_counted_so_it_cannot_loop(tmp_path):
+    # Any exception from the driver (not only PowerError) must count as an attempt,
+    # or the guard would let the plug be cut again on the next loop.
+    class Weird(Plug):
+        def power_cycle(self, off):
+            self.cycles += 1
+            raise ValueError("garbled reply")
+
+    fake, plug = FakeHA(API_DOWN), Weird()
+    w, inbox, _ = watcher(tmp_path, fake, plug=plug, power_cycle=PC, alerts={"realert_minutes": 0})
+    run(w, fake, 30)
+    assert plug.cycles == 1
+    assert len(w.state["power"]["cycles"]) == 1
+    assert any("power cycle FAILED" in m.title for m in inbox.msgs)
+
+
+def test_power_cycle_attempt_is_saved_before_the_plug_is_touched(tmp_path):
+    seen = []
+
+    class Spy(Plug):
+        def power_cycle(self, off):
+            seen.append(json.loads((tmp_path / "state.json").read_text())["power"]["cycles"])
+
+    fake = FakeHA(API_DOWN)
+    w, _, _ = watcher(tmp_path, fake, plug=Spy(), power_cycle=PC)
+    run(w, fake, 11)
+    assert len(seen) == 1 and len(seen[0]) == 1
+
+
+def test_restart_after_a_long_gap_does_not_trust_the_old_outage_start(tmp_path):
+    # The watcher box and HA both lose power; the state file says the API has been failing
+    # for hours. On start-up the outage clock must restart, or the plug is cut while HA boots.
+    fake, plug = FakeHA(API_DOWN), Plug()
+    w, _, _ = watcher(tmp_path, fake, plug=plug, power_cycle=PC)
+    run(w, fake, 3)
+    later = NOW + timedelta(hours=5)
+    w2, _, _ = watcher(tmp_path, fake, plug=plug, power_cycle=PC)
+    w2.run_once(later)
+    assert plug.cycles == 0
+    assert w2.state["checks"]["api"]["first_failure"] == later.isoformat()
+    for i in range(1, 10):
+        w2.run_once(later + i * M)
+    assert plug.cycles == 0
+    w2.run_once(later + 10 * M)
+    assert plug.cycles == 1
+
+
+def test_wall_clock_jump_restarts_the_outage_clock(tmp_path, monkeypatch):
+    # A box without a real-time clock boots with an old time and then NTP jumps it forward.
+    from ha_watcher import engine
+
+    fake, plug = FakeHA(API_DOWN), Plug()
+    w, _, _ = watcher(tmp_path, fake, plug=plug, power_cycle=PC)
+    clock = {"wall": NOW, "mono": 1000.0}
+    monkeypatch.setattr(engine, "utcnow", lambda: clock["wall"])
+    w.monotonic = lambda: clock["mono"]
+    for _ in range(3):
+        w.run_once()
+        clock["wall"] += M
+        clock["mono"] += 60
+    clock["wall"] += timedelta(hours=6)  # NTP sync; only a minute really passed
+    w.run_once()
+    assert plug.cycles == 0
+    assert w.state["checks"]["api"]["first_failure"] == clock["wall"].isoformat()

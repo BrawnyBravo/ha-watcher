@@ -100,3 +100,82 @@ def test_example_config_is_valid():
     }
     cfg = load_config(ROOT / "config.example.yaml", env=env)
     assert cfg.checks["backup"].enabled
+
+
+# ------------------------------------------------------------------ hardening
+def _parse(mutate, env=None):
+    raw = base_raw()
+    mutate(raw)
+    return parse_config(raw, env={"HA_TOKEN": "x", **(env or {})})
+
+
+def test_string_false_from_an_env_var_means_false():
+    # ${VAR} always expands to a string; "false" used to be truthy, which switched the
+    # power cycle ON when the variable said off.
+    def mutate(r):
+        r["power_cycle"] = {"enabled": "${PC_ON:-false}", "host": "192.0.2.20"}
+        r["checks"]["host"] = {"enabled": "${HOST_ON}", "host": "192.0.2.10"}
+        r["home_assistant"]["verify_ssl"] = "${VERIFY:-no}"
+
+    cfg = _parse(mutate, {"HOST_ON": "False"})
+    assert cfg.power_cycle.enabled is False
+    assert cfg.checks["host"].enabled is False
+    assert cfg.home_assistant.verify_ssl is False
+    cfg = _parse(mutate, {"HOST_ON": "true", "PC_ON": "yes"})
+    assert cfg.checks["host"].enabled is True and cfg.power_cycle.enabled is True
+
+
+@pytest.mark.parametrize(
+    "mutate, msg",
+    [
+        (lambda r: r.update(power_cycle={"enabled": "maybe", "host": "h"}), "power_cycle.enabled"),
+        (lambda r: r["checks"].update(api={"enabled": 2}), "checks.api.enabled"),
+        (lambda r: r.update(heartbeat={"enabled": "sometimes"}), "heartbeat.enabled"),
+        (
+            lambda r: r["checks"].update(entities={"enabled": True, "entity_ids": "sensor.one"}),
+            "checks.entities.entity_ids: must be a list",
+        ),
+        (
+            lambda r: r["checks"].update(supervisor={"addons": "core_mosquitto"}),
+            "checks.supervisor.addons: must be a list",
+        ),
+        (
+            lambda r: r.update(power_cycle={"enabled": True, "host": "h", "trigger_checks": "api"}),
+            "power_cycle.trigger_checks: must be a list",
+        ),
+        (lambda r: r["checks"].update(memory={"max_percent": "high"}), "checks.memory.max_percent"),
+        (lambda r: r["checks"].update(host={"port": 70000}), "checks.host.port"),
+        (lambda r: r["checks"].update(host={"timeout_seconds": 0}), "checks.host.timeout_seconds"),
+        (lambda r: r["home_assistant"].update(timeout_seconds=0), "home_assistant.timeout_seconds"),
+        (lambda r: r["home_assistant"].update(ca_file="/nonexistent/ca.pem"), "ca_file"),
+        (lambda r: r.update(deadman={"url": "hc-ping.com/uuid"}), "deadman.url"),
+        (lambda r: r.update(deadman={"url": "https://hc-ping.com/u", "every_seconds": 0}), "every_seconds"),
+        (lambda r: r.update(power_cycle={"enabled": True, "host": "h", "switch_id": -1}), "switch_id"),
+        (lambda r: r.update(alerts={"max_per_hour": 2.5}), "alerts.max_per_hour"),
+        (lambda r: r.update(name=""), "name"),
+        (lambda r: r.update(state_file=""), "state_file"),
+        (
+            lambda r: r.update(
+                power_cycle={"enabled": True, "host": "h", "after_minutes": 10},
+                recovery_command={"enabled": True, "command": ["true"], "after_minutes": 10},
+            ),
+            "power_cycle.after_minutes must be greater than recovery_command.after_minutes",
+        ),
+    ],
+)
+def test_hardened_validation_errors(mutate, msg):
+    with pytest.raises(ConfigError, match=msg):
+        _parse(mutate)
+
+
+def test_ca_file_that_exists_is_accepted(tmp_path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("x", encoding="utf-8")
+    cfg = _parse(lambda r: r["home_assistant"].update(ca_file=str(ca)))
+    assert cfg.home_assistant.ca_file == str(ca)
+
+
+def test_secrets_are_not_in_the_config_repr():
+    cfg = _parse(lambda r: r.update(power_cycle={"enabled": True, "host": "h", "password": "plugpw"}))
+    text = repr(cfg)
+    assert "plugpw" not in text and "token='x'" not in text

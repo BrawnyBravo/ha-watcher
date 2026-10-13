@@ -46,9 +46,15 @@ class ShellyGen2Driver:
             raise PowerError(f"Shelly unreachable: {type(exc).__name__}") from exc
         if resp.status_code != 200:
             raise PowerError(f"Shelly returned HTTP {resp.status_code}")
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            raise PowerError("Shelly reply not understood (is this a Gen2 or newer device?)") from None
+        if not isinstance(data, dict):
+            raise PowerError("Shelly reply not understood")
         if "error" in data:
-            raise PowerError(f"Shelly error: {data['error'].get('message', data['error'])}")
+            err = data["error"]
+            raise PowerError(f"Shelly error: {err.get('message', err) if isinstance(err, dict) else err}")
 
 
 class KasaDriver:
@@ -140,5 +146,10 @@ def run_cycle(driver: Any, cfg: PowerCycleConfig) -> str:
     if cfg.dry_run:
         return "dry run: would have power-cycled the host"
     start = time.monotonic()
-    driver.power_cycle(cfg.off_seconds)
+    try:
+        driver.power_cycle(cfg.off_seconds)
+    except PowerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any driver trouble is a failed attempt
+        raise PowerError(f"power cycle failed: {type(exc).__name__}") from exc
     return f"power-cycled the host (off {cfg.off_seconds}s, took {time.monotonic() - start:.0f}s)"

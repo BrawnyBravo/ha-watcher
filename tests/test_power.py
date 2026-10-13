@@ -142,3 +142,24 @@ def test_run_cycle_dry_run_does_not_touch_driver():
             raise AssertionError("must not be called")
 
     assert "dry run" in run_cycle(Boom(), pc(dry_run=True))
+
+
+def test_shelly_non_json_reply_is_a_power_error():
+    t = httpx.MockTransport(lambda r: httpx.Response(200, text="<html>not rpc</html>"))
+    with pytest.raises(PowerError, match="not understood"):
+        ShellyGen2Driver(pc(), transport=t).power_cycle(15)
+
+
+def test_shelly_error_that_is_not_a_dict():
+    t = httpx.MockTransport(lambda r: httpx.Response(200, json={"error": "denied"}))
+    with pytest.raises(PowerError, match="denied"):
+        ShellyGen2Driver(pc(), transport=t).power_cycle(15)
+
+
+def test_run_cycle_turns_any_driver_exception_into_a_power_error():
+    class Weird:
+        def power_cycle(self, s):
+            raise RuntimeError("driver bug")
+
+    with pytest.raises(PowerError, match="RuntimeError"):
+        run_cycle(Weird(), pc())
