@@ -130,3 +130,34 @@ def test_test_call_refuses_without_twilio(tmp_path, monkeypatch, capsys):
     p = write_cfg(tmp_path, MINIMAL)
     assert cli.main(["--test-call", "-c", str(p)]) == 2
     assert "Phone call: off" in capsys.readouterr().err
+
+
+def test_check_config_rejects_a_ca_file_that_is_not_a_certificate(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HA_TOKEN", "x")
+    ca = tmp_path / "ca.pem"
+    ca.write_text("not a certificate", encoding="utf-8")
+    text = MINIMAL.replace("token: ${HA_TOKEN}", f"token: ${{HA_TOKEN}}\n  ca_file: {ca.as_posix()}")
+    p = write_cfg(tmp_path, text)
+    assert cli.main(["--check-config", "-c", str(p)]) == 2
+    assert "ca_file" in capsys.readouterr().err
+
+
+def test_check_config_rejects_unknown_notifier_keys(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HA_TOKEN", "x")
+    p = write_cfg(tmp_path, MINIMAL + "notifiers:\n  - type: ntfy\n    topic: t\n    priority: max\n")
+    assert cli.main(["--check-config", "-c", str(p)]) == 2
+    assert "notifiers[0]: unknown key(s) priority" in capsys.readouterr().err
+
+
+def test_sigterm_ends_the_process_cleanly(monkeypatch):
+    import signal
+
+    seen = {}
+    monkeypatch.setattr(signal, "signal", lambda sig, fn: seen.setdefault(sig, fn))
+    cli._exit_on_sigterm()
+    try:
+        seen[signal.SIGTERM](signal.SIGTERM, None)
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:
+        raise AssertionError("SIGTERM handler did not exit")

@@ -221,7 +221,12 @@ CHECK_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 COMMON_KEYS = {"enabled", "failures_before_alert", "every_seconds"}
 
-NOTIFIER_TYPES = {"ntfy", "webhook", "email"}
+NOTIFIER_KEYS = {
+    "ntfy": {"server", "topic", "token"},
+    "webhook": {"url", "format", "headers"},
+    "email": {"host", "port", "security", "username", "password", "from", "to"},
+}
+NOTIFIER_TYPES = set(NOTIFIER_KEYS)
 TOP_LEVEL_KEYS = {
     "home_assistant",
     "checks",
@@ -358,6 +363,9 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     for i, n in enumerate(notifiers):
         if not isinstance(n, dict) or n.get("type") not in NOTIFIER_TYPES:
             raise ConfigError(f"notifiers[{i}].type must be one of {sorted(NOTIFIER_TYPES)}")
+        unknown = set(n) - NOTIFIER_KEYS[n["type"]] - {"type"}
+        if unknown:
+            raise ConfigError(f"notifiers[{i}]: unknown key(s) {', '.join(sorted(unknown))}")
 
     cfg = Config(
         home_assistant=ha,

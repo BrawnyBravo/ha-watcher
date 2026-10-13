@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import shutil
+import signal
 import sys
 
 import httpx
@@ -28,6 +29,12 @@ def build_watcher(cfg: Config) -> Watcher:
     notifiers = build_notifiers(cfg.notifiers, http)
     driver = build_driver(cfg.power_cycle) if cfg.power_cycle.enabled else None
     return Watcher(cfg, HAClient(cfg.home_assistant), notifiers, http, driver=driver)
+
+
+def _exit_on_sigterm() -> None:
+    """Stop cleanly on SIGTERM (systemd, docker stop). As PID 1 in a container Python
+    would otherwise ignore it and be killed 10 seconds later."""
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
 
 
 def summarize(cfg: Config) -> str:
@@ -108,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.check_config:
         try:
+            HAClient(cfg.home_assistant).close()  # loads ca_file, if any
             build_notifiers(cfg.notifiers, httpx.Client())
             if cfg.power_cycle.enabled:
                 build_driver(cfg.power_cycle)
@@ -117,6 +125,9 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, PowerError) as exc:
             print(f"config error: {exc}", file=sys.stderr)
             return 2
+        except OSError as exc:  # includes ssl.SSLError from a bad ca_file
+            print(f"config error: home_assistant.ca_file: {type(exc).__name__}", file=sys.stderr)
+            return 2
         print("Config OK\n" + summarize(cfg))
         return 0
 
@@ -124,6 +135,9 @@ def main(argv: list[str] | None = None) -> int:
         watcher = build_watcher(cfg)
     except (ValueError, PowerError) as exc:
         print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:  # includes ssl.SSLError from a bad ca_file
+        print(f"config error: home_assistant.ca_file: {type(exc).__name__}", file=sys.stderr)
         return 2
 
     if args.test_call:
@@ -150,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{'OK  ' if r.ok else 'FAIL'} {r.key:<32} {r.message}")
         return 0 if all(r.ok for r in results) else 1
 
+    _exit_on_sigterm()
     try:
         watcher.run_forever()
     except KeyboardInterrupt:
