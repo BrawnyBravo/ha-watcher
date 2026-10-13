@@ -488,7 +488,7 @@ def _validate_phone_call(p: PhoneCallConfig, checks: dict[str, CheckConfig]) -> 
         raise ConfigError("phone_call.message: must be 1 to 500 characters")
     try:
         p.message.format(name="x", minutes=1)
-    except (KeyError, IndexError, ValueError):
+    except (KeyError, IndexError, ValueError, AttributeError):
         raise ConfigError("phone_call.message: only {name} and {minutes} may be used") from None
 
 

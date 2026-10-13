@@ -299,8 +299,9 @@ domain; it is fetched at most once a week and only the entries for your domains 
 Each domain then costs one request a day to its registry, at most one RDAP request goes
 out per watch loop, requests carry a `ha-watcher/<version>` user agent, and a `403` or
 `429` stops all RDAP lookups for a day (or for the server's `Retry-After`, if longer). No
-account or key is needed. Some registries (several country-code domains) publish no
-expiry date over RDAP; those report "cannot check" and should be removed from the list.
+account or key is needed. Some top-level domains have no RDAP server in the IANA file
+(for example `.io` and `.de` when this was written) and some registries publish no expiry
+date over RDAP; those report "cannot check" and should be removed from the list.
 
 ### `phone_call`
 
