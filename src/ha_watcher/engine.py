@@ -13,6 +13,8 @@ import httpx
 from ha_watcher import power, recovery
 from ha_watcher.checks import CHECKS, NEEDS_API, Context, Result, detect_busy, fmt_age
 from ha_watcher.config import Config
+from ha_watcher.escalation import PhoneEscalation
+from ha_watcher.expiry import ExpiryWatch
 from ha_watcher.ha import HAClient, HAError
 from ha_watcher.notifiers import Message, Notifier, send_all
 from ha_watcher.state import load_state, parse, save_state, ts
@@ -36,6 +38,8 @@ class Watcher:
         ctx_hooks: dict[str, Any] | None = None,
         local_tz: tzinfo | None = None,
         state_path: str | None = None,
+        cert_lookup: Any = None,
+        caller: Any = None,
     ) -> None:
         self.cfg = cfg
         self.client = client
@@ -47,6 +51,11 @@ class Watcher:
         self.local_tz = local_tz
         self.state_path = state_path or cfg.state_file
         self.state = load_state(self.state_path)
+        notify = lambda msg, now: self._send(msg, now, bypass_limit=True)  # noqa: E731
+        self.expiry = ExpiryWatch(
+            cfg.expiry, self.state["expiry"], http, notify, cfg.name, local_tz, cert_lookup
+        )
+        self.phone = PhoneEscalation(cfg.phone_call, self.state["phone"], http, notify, cfg.name, caller)
 
     # ------------------------------------------------------------------ public
     def run_once(self, now: datetime | None = None) -> list[Result]:
@@ -57,6 +66,8 @@ class Watcher:
         self._busy_probe(results, now)
         if not self._maybe_recovery_command(now):
             self._maybe_power_cycle(now)
+        self.phone.run(now, self._down_since(self.cfg.phone_call.trigger_checks))
+        self.expiry.run(now)
         self._heartbeat(now)
         self._deadman(now)
         save_state(self.state_path, self.state)

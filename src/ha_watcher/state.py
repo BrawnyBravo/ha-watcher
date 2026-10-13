@@ -26,6 +26,8 @@ def empty_state() -> dict[str, Any]:
         "deadman_last": None,
         "power": {"cycles": [], "busy_seen": None, "busy_reason": None, "last_decision": None},
         "recovery": {"runs": [], "last_decision": None},
+        "expiry": {"items": {}, "rdap_servers": {}, "rdap_backoff_until": None},
+        "phone": {"calls": [], "called_outage": None, "last_attempt": None, "last_decision": None},
     }
 
 
@@ -42,8 +44,8 @@ def load_state(path: str | Path) -> dict[str, Any]:
         return empty_state()
     base = empty_state()
     base.update(data)
-    base["power"] = {**empty_state()["power"], **(data.get("power") or {})}
-    base["recovery"] = {**empty_state()["recovery"], **(data.get("recovery") or {})}
+    for key in ("power", "recovery", "expiry", "phone"):
+        base[key] = {**empty_state()[key], **(data.get(key) or {})}
     return base
 
 
