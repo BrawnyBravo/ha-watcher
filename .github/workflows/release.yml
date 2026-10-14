@@ -1,6 +1,7 @@
 # Runs only when a version tag such as v1.0.0 is pushed. Publishes:
 #   - the Python package to PyPI, through trusted publishing (no token stored here;
-#     set it up once on pypi.org: project ha-watcher, workflow release.yml, environment pypi)
+#     set it up once on pypi.org: project ha-watcher, workflow release.yml, environment pypi),
+#     only when the repository variable PUBLISH_PYPI is "true"
 #   - a multi-arch image to ghcr.io/<owner>/ha-watcher (amd64, arm64, arm/v7 for 32-bit Pi OS)
 name: Release
 
@@ -46,6 +47,7 @@ jobs:
 
   pypi-publish:
     needs: pypi-build
+    if: vars.PUBLISH_PYPI == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
