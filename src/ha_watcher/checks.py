@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from ha_watcher.deadline import Bounded, DeadlineExceeded
 from ha_watcher.ha import HAAuthError, HAClient, HAError
 
 UNAVAILABLE = {"unavailable", "unknown"}
@@ -234,6 +235,9 @@ def _ping(host: str, timeout: float) -> bool:
         return False
 
 
+_TCP_LIMIT = Bounded("host check")
+
+
 def check_host(client: HAClient | None, opts: dict[str, Any], ctx: Context) -> list[Result]:
     host, timeout = opts["host"], float(opts["timeout_seconds"])
     if opts["method"] == "ping":
@@ -241,7 +245,10 @@ def check_host(client: HAClient | None, opts: dict[str, Any], ctx: Context) -> l
         return [Result("host", ok, f"Ping {host}: {'reply' if ok else 'no reply'}")]
     port = int(opts["port"])
     try:
-        (ctx.tcp_connect or _tcp_connect)(host, port, timeout)
+        # Bounded as a whole: the name lookup is not covered by the socket timeout.
+        _TCP_LIMIT.call(timeout + 5, ctx.tcp_connect or _tcp_connect, host, port, timeout)
+    except DeadlineExceeded:
+        return [Result("host", False, f"TCP {host}:{port} failed: no answer in time")]
     except OSError as exc:
         return [Result("host", False, f"TCP {host}:{port} failed: {type(exc).__name__}")]
     return [Result("host", True, f"TCP {host}:{port} open")]

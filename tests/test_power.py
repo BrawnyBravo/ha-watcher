@@ -142,3 +142,82 @@ def test_run_cycle_dry_run_does_not_touch_driver():
             raise AssertionError("must not be called")
 
     assert "dry run" in run_cycle(Boom(), pc(dry_run=True))
+
+
+def test_kasa_steps_are_bounded_so_a_silent_plug_cannot_hang_the_watcher():
+    import asyncio
+
+    async def hang(*a, **kw):
+        await asyncio.sleep(3600)
+
+    d = KasaDriver(pc(driver="kasa"), discover=hang, step_timeout=0.05)
+    with pytest.raises(PowerError, match="TimeoutError"):
+        d.power_cycle(1)
+
+    class Stuck(FakePlug):
+        async def turn_on(self):
+            self.calls.append("on")
+            await asyncio.sleep(3600)
+
+    plug, sleeps = Stuck(), []
+    d = kasa(plug, sleeps)
+    d.step_timeout = 0.05
+    with pytest.raises(PowerError, match=r"did not turn back on \(TimeoutError\): the host may be OFF"):
+        d.power_cycle(15)
+    assert plug.calls.count("on") == 3 and plug.calls[-1] == "disconnect"
+
+
+def test_shelly_non_json_reply_is_a_power_error():
+    t = httpx.MockTransport(lambda r: httpx.Response(200, text="<html>not rpc</html>"))
+    with pytest.raises(PowerError, match="not understood"):
+        ShellyGen2Driver(pc(), transport=t).power_cycle(15)
+
+
+def test_shelly_error_that_is_not_a_dict():
+    t = httpx.MockTransport(lambda r: httpx.Response(200, json={"error": "denied"}))
+    with pytest.raises(PowerError, match="denied"):
+        ShellyGen2Driver(pc(), transport=t).power_cycle(15)
+
+
+def test_run_cycle_turns_any_driver_exception_into_a_power_error():
+    class Weird:
+        def power_cycle(self, s):
+            raise RuntimeError("driver bug")
+
+    with pytest.raises(PowerError, match="RuntimeError"):
+        run_cycle(Weird(), pc())
+
+
+def test_kasa_off_reply_lost_still_turns_the_plug_back_on():
+    import asyncio
+
+    class LostReply(FakePlug):
+        async def turn_off(self):
+            self.calls.append("off")
+            await asyncio.sleep(3600)  # switched off, but the reply never comes
+
+    plug, sleeps = LostReply(), []
+    d = kasa(plug, sleeps)
+    d.step_timeout = 0.05
+    with pytest.raises(PowerError, match="turn-off"):
+        d.power_cycle(15)
+    assert plug.calls == ["update", "off", "on", "disconnect"]
+
+
+def test_kasa_failure_to_turn_on_says_the_host_may_be_off():
+    plug, sleeps = FakePlug(fail_on=5), []
+    with pytest.raises(PowerError, match="may be OFF"):
+        kasa(plug, sleeps).power_cycle(15)
+
+
+def test_cycle_in_progress_flag():
+    from ha_watcher import power
+
+    seen = []
+
+    class Spy:
+        def power_cycle(self, s):
+            seen.append(power.cycle_in_progress())
+
+    run_cycle(Spy(), pc())
+    assert seen == [True] and not power.cycle_in_progress()

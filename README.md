@@ -47,8 +47,10 @@ Also:
 - Optional **phone call** through Twilio when Home Assistant has been down for 30 minutes
   (configurable) and has not come back: once per outage, at most twice a day. **Off unless
   the Twilio environment variables are set**; see "Phone call escalation" below.
+- Optional **status push** to the [HA Watcher integration](https://github.com/BrawnyBravo/ha-watcher-companion),
+  so Home Assistant shows the watcher's checks as entities (`home_assistant_push`).
 - One YAML file, secrets from environment variables, a JSON state file written atomically,
-  `--check-config`, `--once`, `--test-notify` and `--test-call` modes.
+  `--check-config`, `--once`, `--test-notify`, `--test-call` and `--health` modes.
 
 Three runtime dependencies: `httpx`, `PyYAML`, `websockets`.
 
@@ -73,54 +75,76 @@ combination is the reason this exists; the generic parts are deliberately thin.
 
 ## Quick start: Raspberry Pi (or any Linux box)
 
-You need Python 3.11+ (Raspberry Pi OS Bookworm ships 3.11, Trixie ships 3.13).
+About ten minutes. You need Python 3.11+ (Raspberry Pi OS Bookworm ships 3.11, Trixie
+ships 3.13) and a way to get alerts; the quickest is the free [ntfy](https://ntfy.sh) app
+with a topic name nobody can guess.
 
 1. In Home Assistant: your profile, **Security** tab, **Long-lived access tokens**,
    create one called `ha-watcher`. See [Security](#security) for which user to create it on.
-2. On the Pi:
+2. On the Pi, install it into its own virtual environment and fetch the example files:
 
    ```sh
-   sudo useradd --system --home /var/lib/ha-watcher ha-watcher
-   sudo install -d -o ha-watcher /var/lib/ha-watcher
+   sudo apt install -y python3-venv git
+   sudo useradd --system --user-group --home /var/lib/ha-watcher ha-watcher
+   sudo install -d -o ha-watcher -g ha-watcher -m 750 /var/lib/ha-watcher
    sudo python3 -m venv /opt/ha-watcher/venv
-   sudo /opt/ha-watcher/venv/bin/pip install ha-watcher        # add [kasa] for Kasa plugs
+   sudo /opt/ha-watcher/venv/bin/pip install "ha-watcher @ git+https://github.com/BrawnyBravo/ha-watcher@v1.0.0"
+   # for a Kasa/Tapo plug: "ha-watcher[kasa] @ git+https://github.com/BrawnyBravo/ha-watcher@v1.0.0"
    sudo mkdir -p /etc/ha-watcher
-   sudo curl -o /etc/ha-watcher/config.yaml \
-     https://raw.githubusercontent.com/BrawnyBravo/ha-watcher/main/config.example.yaml
-   sudo nano /etc/ha-watcher/config.yaml                       # url, checks, notifiers
+   base=https://raw.githubusercontent.com/BrawnyBravo/ha-watcher/v1.0.0
+   sudo curl -fsSL -o /etc/ha-watcher/config.yaml $base/config.example.yaml
+   sudo curl -fsSL -o /etc/systemd/system/ha-watcher.service $base/contrib/ha-watcher.service
+   ```
+
+3. Edit the config and put the secrets in a separate file only the service can read:
+
+   ```sh
+   sudo nano /etc/ha-watcher/config.yaml   # home_assistant.url, notifiers; remove the ones you don't use
    sudo install -m 640 -g ha-watcher /dev/null /etc/ha-watcher/env
-   sudo nano /etc/ha-watcher/env                               # HA_TOKEN=..., NTFY_TOPIC=...
+   sudo nano /etc/ha-watcher/env           # one per line: HA_TOKEN=...  NTFY_TOPIC=...
    ```
 
-   Until it is on PyPI, install from a checkout: `pip install /path/to/ha-watcher`.
+   The example's `state_file: /var/lib/ha-watcher/state.json` matches the service.
 
-3. Test it as the service user:
+4. Test it as the service user. Fix anything `--check-config` reports before going on:
 
    ```sh
-   sudo -u ha-watcher bash -c 'set -a; . /etc/ha-watcher/env;
-     /opt/ha-watcher/venv/bin/ha-watcher -c /etc/ha-watcher/config.yaml --check-config'
-   # then the same with --test-notify, then --once
+   run() { sudo -u ha-watcher bash -c "set -a; . /etc/ha-watcher/env; set +a;
+     /opt/ha-watcher/venv/bin/ha-watcher -c /etc/ha-watcher/config.yaml $*"; }
+   run --check-config     # "Config OK" and a summary
+   run --test-notify      # your phone should buzz
+   run --once             # one real cycle: every check printed with OK or FAIL
    ```
 
-4. Run it as a service with [`contrib/ha-watcher.service`](contrib/ha-watcher.service):
+5. Start the service and watch its log:
 
    ```sh
-   sudo cp contrib/ha-watcher.service /etc/systemd/system/
    sudo systemctl daemon-reload && sudo systemctl enable --now ha-watcher
    journalctl -u ha-watcher -f
    ```
 
-   Set `state_file: /var/lib/ha-watcher/state.json` in the config.
+   To see it work end to end, stop Home Assistant (or unplug its network cable) for about
+   five minutes: one alert arrives after `failures_before_alert` loops, and one recovery
+   message when it is back.
+
+To upgrade later, run the same `pip install` line with the new version tag, then
+`sudo systemctl restart ha-watcher`. The state file carries over between versions.
 
 ## Quick start: Docker
 
+Release images are published for `linux/amd64`, `linux/arm64` and `linux/arm/v7` (32-bit
+Raspberry Pi OS) as `ghcr.io/brawnybravo/ha-watcher:1` (or a full version such as `1.0.0`).
+To build your own instead, in a checkout: `docker build -t ha-watcher .` with BuildKit, the
+default builder since Docker 23. On an older Docker (for example Debian's `docker.io` 20.10)
+use `DOCKER_BUILDKIT=1 docker build -t ha-watcher .` or `docker buildx build --load -t ha-watcher .`.
+
 ```sh
-docker build -t ha-watcher .
 docker run -d --name ha-watcher --restart unless-stopped \
+  -e TZ=Europe/London \
   -v /path/to/config.yaml:/config/config.yaml:ro \
   -v ha-watcher-data:/data \
   --env-file /path/to/ha-watcher.env \
-  ha-watcher
+  ghcr.io/brawnybravo/ha-watcher:1
 ```
 
 Or with Compose:
@@ -128,9 +152,12 @@ Or with Compose:
 ```yaml
 services:
   ha-watcher:
-    build: .
+    image: ghcr.io/brawnybravo/ha-watcher:1
     restart: unless-stopped
-    env_file: ./ha-watcher.env
+    stop_grace_period: 90s       # lets a power cycle finish; see below
+    environment:
+      TZ: Europe/London          # local time for heartbeat.time
+    env_file: ./ha-watcher.env   # HA_TOKEN=..., NTFY_TOPIC=...
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - ha-watcher-data:/data
@@ -138,8 +165,19 @@ volumes:
   ha-watcher-data:
 ```
 
-Set `state_file: /data/state.json`. Do not run the container on the Home Assistant host:
-it would go down with the thing it watches.
+Set `state_file: /data/state.json`. The container runs as an unprivileged user (uid 10001),
+so the config file must be world-readable (`chmod 644`); keep the secrets in the env file,
+not in the config. Check the config before starting:
+`docker run --rm --env-file ha-watcher.env -v $PWD/config.yaml:/config/config.yaml:ro ghcr.io/brawnybravo/ha-watcher:1 --check-config`.
+`docker ps` shows `healthy` once the watcher is finishing loops (see `--health`). Do not
+run the container on the Home Assistant host: it would go down with the thing it watches.
+
+**With `power_cycle` enabled, give the container time to finish a cycle when it is
+stopped.** A stop request during a power cycle waits for the plug to be switched back on,
+but Docker kills the container after 10 seconds by default, and a Kasa cycle takes
+`off_seconds` plus up to three turn-on tries. Use `--stop-timeout 90` with `docker run`, or
+`stop_grace_period: 90s` in Compose (this also covers updates by tools such as Watchtower).
+Shelly plugs switch themselves back on (`toggle_after`), so they are safe either way.
 
 ## Command line
 
@@ -149,6 +187,8 @@ ha-watcher -c config.yaml --check-config  validate config (and notifier/plug set
 ha-watcher -c config.yaml --once          one full cycle, print each result, exit 1 if anything failed
 ha-watcher -c config.yaml --test-notify   send a test message to every notifier
 ha-watcher -c config.yaml --test-call     place one test phone call (needs the TWILIO_* variables)
+ha-watcher -c config.yaml --health        exit 0 if the running watcher saved a loop in the last
+                                          max(5 min, 3 x interval_seconds); used by the Docker HEALTHCHECK
 ```
 
 `--once` is a real cycle: it updates the state file and can send alerts, so it also works
@@ -161,11 +201,20 @@ from cron if you prefer that to a long-running service:
 (Per-check `every_seconds` still applies, because the last run time is kept in the state
 file; the debounce counts runs of that check.)
 
+Timing from cron is only as fine as the cron spacing: `failures_before_alert: 3` means three
+cron runs, and `after_minutes` for the recovery command, power cycle and phone call is
+reached at the first run after that much time. Keep the spacing well below those delays
+(every 1 to 2 minutes). In `--once` mode the watcher cannot tell a long gap between runs
+from a stopped service, so the "outage clock restarts after a gap" protection described
+under the power cycle applies to the long-running service only.
+
 ## Configuration reference
 
 See [`config.example.yaml`](config.example.yaml) for a complete, commented file. Any string
 may use `${VAR}` or `${VAR:-default}`; a missing variable without a default is a config
-error that names the variable. Unknown keys are errors, so typos are caught.
+error that names the variable. Unknown keys are errors, so typos are caught. A value that
+comes from a variable is always text: `true`/`false` (also `yes`/`no`, `on`/`off`, `1`/`0`)
+work for on/off settings, and number settings accept text that is a number (`"8123"`).
 
 ### Top level
 
@@ -209,7 +258,7 @@ healthy response time with `--once` before tightening `max_response_ms`.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `realert_minutes` | `60` | Reminder interval while still failing. `0` = once per outage. |
-| `max_per_hour` | `20` | Cap on messages. Recoveries, heartbeats and power-cycle reports bypass it. |
+| `max_per_hour` | `20` | Cap on messages. Recoveries, heartbeats and power-cycle reports bypass it. An alert held back by the cap is not dropped: it goes out on the first loop with room, unless the problem has cleared by then. |
 
 ### `notifiers`
 
@@ -244,7 +293,7 @@ notifiers:
 | --- | --- | --- |
 | `heartbeat.enabled` | `false` | Send one message a day with the current status. |
 | `heartbeat.time` | `09:00` | Local time of the watcher box (24-hour). |
-| `deadman.url` | none | Pinged with `GET` every `every_seconds`. |
+| `deadman.url` | none | Pinged with `GET` every `every_seconds`. Must start with `http://` or `https://`; empty = off. |
 | `deadman.every_seconds` | `60` | |
 | `deadman.signal_failures` | `false` | Ping `<url>/fail` while any alert is open (healthchecks.io convention). |
 
@@ -253,7 +302,7 @@ notifiers:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Nothing is ever switched unless this is true. |
-| `driver` | `shelly` | `shelly` (Gen2/Gen3/Gen4 local RPC) or `kasa` (needs `pip install ha-watcher[kasa]`). |
+| `driver` | `shelly` | `shelly` (Gen2/Gen3/Gen4 local RPC) or `kasa` (needs the `kasa` extra: install `"ha-watcher[kasa] @ git+https://github.com/BrawnyBravo/ha-watcher@v1.0.0"`). |
 | `host` | required | Plug address, e.g. `192.0.2.20`. |
 | `switch_id` | `0` | Shelly switch channel. |
 | `username` / `password` | none | Shelly digest auth (user `admin`), or Kasa/Tapo credentials if the device needs them. |
@@ -263,7 +312,7 @@ notifiers:
 | `cooldown_minutes` | `60` | Minimum gap between cycles. |
 | `max_per_day` | `2` | Cap in any rolling 24 hours. Failed attempts count too. |
 | `busy_grace_minutes` | `120` | Hold off if a backup or update was seen running within this many minutes. |
-| `dry_run` | `false` | Report what would happen without switching. |
+| `dry_run` | `false` | Report what would happen without switching. A dry run follows the same cooldown and daily cap, so it reports once per would-be cycle, not every loop. |
 
 ### `recovery_command`
 
@@ -278,7 +327,7 @@ notifiers:
 | `cooldown_minutes` | `60` | Minimum gap between runs. |
 | `max_per_day` | `2` | Cap in any rolling 24 hours. Failed attempts count too. The run history lives in the state file, so restarting the watcher does not reset it. |
 | `busy_grace_minutes` | `0` | If above 0, hold off when a backup or update was seen running within this many minutes (same probe as the power cycle). Off by default: a restart is not dangerous the way cutting power is. |
-| `dry_run` | `false` | Report what would happen without running anything. |
+| `dry_run` | `false` | Report what would happen without running anything. Follows the same cooldown and daily cap as a real run. |
 
 ### `expiry`
 
@@ -318,6 +367,49 @@ The account and numbers come from the environment only (`TWILIO_ACCOUNT_SID`,
 `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `TWILIO_TO_NUMBER`); a `twilio` key in the file
 is an error. `--check-config` says whether calls are on, or which variables are missing,
 without printing their values.
+
+### `home_assistant_push`
+
+Off unless `url` is set. See "Home Assistant companion" below.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `url` | none | The webhook URL the HA Watcher integration shows when it is added. It is a secret: anyone who has it can post reports. Use `${HA_PUSH_URL}`. Empty = off. |
+| `every_seconds` | `60` | Seconds between reports, 1 to 86400. Keep it well under half the integration's offline timeout (default 5 minutes). |
+| `timeout_seconds` | `10` | Per report, at most 30. |
+| `secret` | none | Optional shared secret, at least 16 characters. When set, each report carries `X-HA-Watcher-Timestamp` and `X-HA-Watcher-Signature: sha256=<HMAC-SHA256 of "timestamp.body">`; set the same secret in the integration. Use `${HA_PUSH_SECRET}`. |
+| `watcher_id` | host name | Stable id for this watcher install. |
+
+## Home Assistant companion
+
+The optional [HA Watcher integration](https://github.com/BrawnyBravo/ha-watcher-companion)
+shows the watcher inside Home Assistant: one problem sensor per check, the watcher's
+version and an "online" sensor that turns off when reports stop. Add the integration in
+Home Assistant, copy the webhook URL it shows into `home_assistant_push.url` (through the
+env file), and restart the watcher.
+
+This is a convenience, not part of the alerting: reports go to Home Assistant, which is
+exactly what may be down. A failed report is dropped and logged once until reports work
+again; it never delays or changes an alert. Reports follow the integration's payload
+contract (version 1): check names are lowercased with anything outside `a-z0-9_` turned
+into `_` (`core:safe_mode` becomes `core_safe_mode`), names longer than 40 characters or
+already taken are shortened with a hash. Names are worked out once over every check the
+config can report, in sorted order, so a check keeps its name whatever else is in a
+report. At most 32 checks are sent, the first 32 in sorted order of their keys, so the
+same ones every time (the integration creates at most 32 entities per install). Many
+`entities` or add-ons can therefore push some checks past the 32nd; alerts still cover
+them.
+
+- A signed report must carry a newer timestamp than the last one Home Assistant accepted.
+  A watcher restarted within the same second as its last signed report, or one whose clock
+  steps back, gets `401` until its time passes that report; it logs one warning and
+  recovers on its own.
+- Give a Kasa plug's `power_cycle.host` as an IP address, not a host name: a stalled name
+  lookup can hold up a power cycle.
+
+The report's "outage" flag means Home Assistant itself is down (the `api` or `core`
+check is alerting), not that any check is failing, and `alerts_sent_24h` counts problem
+alerts that reached at least one notifier (not power-cycle or restart reports).
 
 ## Phone call escalation
 
@@ -415,13 +507,19 @@ add-on and give the watcher a key that can do exactly one thing.
 **With a power cycle as well**, set `power_cycle.after_minutes` well above
 `recovery_command.after_minutes` plus a restart (for example 10 and 20, or 30): the soft
 restart goes first, and the plug only acts if Home Assistant is still down afterwards.
+`--check-config` refuses a power cycle delay that is not greater than the restart delay.
 Giving the power cycle `trigger_checks: [host]` makes it act only when the machine itself
 stops answering. The two never act in the same loop.
 
 ## How the power cycle decides
 
-1. Every trigger check has been failing continuously for `after_minutes`.
-2. No cycle in the last `cooldown_minutes`, and fewer than `max_per_day` in the last 24 hours.
+1. Every trigger check has been failing continuously for `after_minutes`, as seen by a
+   running watcher. If the watcher was not running for a while, or the system clock jumps
+   (a Raspberry Pi has no real-time clock and sets its time from the network after boot),
+   the outage is counted again from that moment, so nothing fires on time nobody watched.
+2. No cycle in the last `cooldown_minutes`, and fewer than `max_per_day` in the last 24
+   hours. The attempt is recorded in the state file *before* the plug is switched, so a
+   crash or a broken plug cannot lead to a second cycle on the next loop.
 3. **Busy hold-off.** While HA is up, each loop reads `/api/states` and records when it last
    saw an `update.*` entity with `in_progress` set, or the backup manager state sensor in
    `create_backup`, `receive_backup` or `restore_backup`. If that was within
@@ -462,6 +560,32 @@ default, capped, and announced every time.
 - **Twilio.** The auth token and both phone numbers stay in the environment; they are never
   logged, printed by `--check-config`, or put in a notification.
 - **The plug.** A Shelly with no password lets anyone on your LAN switch it. Set one.
+- **The SSH key for `recovery_command`, in short:** a key made only for this, readable only
+  by the service user (`chmod 600`, owned by `ha-watcher`); on the Home Assistant side a
+  forced `command=` plus `no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding`
+  in `authorized_keys`; the host key pinned with `StrictHostKeyChecking=yes` and a
+  `UserKnownHostsFile`; `BatchMode=yes` so it never waits for a password prompt. Check by
+  hand that the key cannot open a shell (see "Restarting Home Assistant Core automatically").
+- **The state file** holds no secrets (times, counts and check messages), but keep its
+  folder owned by the service user.
+- **Reporting a vulnerability:** see [SECURITY.md](SECURITY.md).
+
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+| --- | --- |
+| `config error: ... environment variable X is not set` | The variable is used in the config but missing from the environment. With systemd it must be in `/etc/ha-watcher/env`; when testing by hand, load that file first (`set -a; . /etc/ha-watcher/env`). Use `${X:-}` for optional values. |
+| `config error: ... unknown key(s)` | A typo, or a key from another section. The message names the section; compare with `config.example.yaml`. |
+| `Token rejected` / `401` | The long-lived token was deleted, or belongs to another HA instance. Create a new one and update the env file. |
+| `API unreachable: GET /api/: ConnectError` | Wrong `home_assistant.url`, HA down, or a firewall. Try `curl -sS <url>/api/ -H "Authorization: Bearer $HA_TOKEN"` from the watcher box. |
+| `CERTIFICATE_VERIFY_FAILED` / `SSLError` | HTTPS with a self-signed certificate: point `ca_file` at its CA (or the certificate itself). Leave `verify_ssl` on. |
+| `Cannot query Supervisor ... administrator` | The Supervisor checks and the WebSocket backup source need an admin user's token; use `backup.source: sensor` and turn `supervisor` off to stay non-admin. |
+| `--test-notify` says `Sent to 0 of 1` | The log line above it names the notifier and the HTTP status. 401/403: wrong ntfy token or access rules; 404: wrong webhook URL. |
+| Heartbeat arrives at the wrong hour | It uses the watcher box's local time. Set the system timezone (`sudo timedatectl set-timezone ...`), or `TZ=` for Docker. |
+| `ping` check always fails under systemd | The service runs with `NoNewPrivileges`, so `ping` must work without extra privileges: check `sysctl net.ipv4.ping_group_range` covers the service's group (the systemd default `0 2147483647` does), or use `method: tcp` on a port that answers. |
+| Container `unhealthy` | `docker logs ha-watcher`. The health check fails when no loop has been saved recently: a config error, or `/data` not writable by uid 10001. |
+| No alert during a test outage | Each check alerts after `failures_before_alert` consecutive failures, one per loop (3 minutes for the API by default). Run with `-v` to see every result. |
+| "rate limit reached" in the log | More than `alerts.max_per_hour` messages in an hour, usually a flapping check. Raise `failures_before_alert` for it; held-back alerts still go out later. |
 
 ## Tested on
 
@@ -482,7 +606,9 @@ spare the SD card; ha-watcher itself only writes its small state file.
   through the WebSocket source.
 - The busy hold-off only knows what HA reported before it went down (see above).
 - The `ping` host method shells out to the system `ping`; the Docker image includes it.
-- Alerts that fail to deliver are logged, not queued for later.
+- An alert that no notifier accepted is tried again on the next loop until one does, but it
+  lives in memory and the state file only: there is no separate outbox, and recovery,
+  heartbeat and action reports that fail to deliver are logged, not retried.
 - A phone call needs the watcher's own internet connection, like every other alert.
 - Expiry checks run inside the watch loop: an unreachable host can delay one loop by up to
   `expiry.timeout_seconds`, at most once an hour.
@@ -494,9 +620,13 @@ spare the SD card; ha-watcher itself only writes its small state file.
 ```sh
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev,kasa]"
-pytest
+pytest --cov
 ruff check . && ruff format --check .
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Releases are cut by pushing a `vX.Y.Z` tag that
+matches `__version__`: the release workflow tests, pushes the multi-arch image to GHCR and, when the
+repository variable `PUBLISH_PYPI` is `true`, publishes to PyPI (trusted publishing).
 
 ## License
 

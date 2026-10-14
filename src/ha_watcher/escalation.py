@@ -23,12 +23,14 @@ from xml.sax.saxutils import escape
 import httpx
 
 from ha_watcher.config import PhoneCallConfig, TwilioCredentials
+from ha_watcher.deadline import Bounded
 from ha_watcher.notifiers import Message
 from ha_watcher.state import parse, ts
 
 log = logging.getLogger(__name__)
 
 TWILIO_CALLS_URL = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Calls.json"
+_LIMIT = Bounded("Twilio")
 
 
 class CallError(Exception):
@@ -44,7 +46,9 @@ def twiml(text: str) -> str:
 def place_call(http: httpx.Client, creds: TwilioCredentials, text: str) -> str:
     """Ask Twilio to place the call. Returns Twilio's call id (CA...)."""
     try:
-        r = http.post(
+        r = _LIMIT.call(
+            30,
+            http.post,
             TWILIO_CALLS_URL.format(sid=creds.account_sid),
             auth=(creds.account_sid, creds.auth_token),
             data={"To": creds.to_number, "From": creds.from_number, "Twiml": twiml(text)},

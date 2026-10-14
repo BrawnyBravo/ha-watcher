@@ -6,8 +6,10 @@ Secrets never live in the file: any string value may contain ``${VAR}`` or
 
 from __future__ import annotations
 
+import math
 import os
 import re
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,7 +51,7 @@ def expand_env(value: Any, env: dict[str, str] | None = None, path: str = "") ->
 @dataclass
 class HomeAssistantConfig:
     url: str
-    token: str
+    token: str = field(repr=False)
     verify_ssl: bool = True
     ca_file: str | None = None  # CA bundle for a self-signed certificate
     timeout_seconds: float = 10.0
@@ -91,7 +93,7 @@ class PowerCycleConfig:
     host: str = ""
     switch_id: int = 0
     username: str | None = None
-    password: str | None = None
+    password: str | None = field(default=None, repr=False)
     after_minutes: float = 10.0
     off_seconds: int = 15
     cooldown_minutes: float = 60.0
@@ -129,6 +131,21 @@ class ExpiryConfig:
     failed_lookups_before_alert: int = 3  # retries: TLS after 1 h, RDAP after 6 h
 
 
+@dataclass
+class HomeAssistantPushConfig:
+    """Status reports to the HA Watcher companion integration. Off unless url is set."""
+
+    url: str | None = field(default=None, repr=False)  # the webhook URL is a secret
+    every_seconds: int = 60
+    timeout_seconds: float = 10.0
+    secret: str | None = field(default=None, repr=False)  # optional HMAC signing key
+    watcher_id: str | None = None  # default: this machine's host name
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+
 TWILIO_ENV = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "TWILIO_TO_NUMBER")
 
 
@@ -162,7 +179,7 @@ class PhoneCallConfig:
 class Config:
     home_assistant: HomeAssistantConfig
     checks: dict[str, CheckConfig]
-    notifiers: list[dict[str, Any]]
+    notifiers: list[dict[str, Any]] = field(repr=False)  # may hold tokens and passwords
     interval_seconds: int = 60
     state_file: str = "ha-watcher-state.json"
     name: str = "Home Assistant"
@@ -173,6 +190,7 @@ class Config:
     recovery_command: RecoveryCommandConfig = field(default_factory=RecoveryCommandConfig)
     expiry: ExpiryConfig = field(default_factory=ExpiryConfig)
     phone_call: PhoneCallConfig = field(default_factory=PhoneCallConfig)
+    home_assistant_push: HomeAssistantPushConfig = field(default_factory=HomeAssistantPushConfig)
 
 
 # Defaults for each check. Anything not listed in COMMON_KEYS is check-specific.
@@ -221,7 +239,12 @@ CHECK_DEFAULTS: dict[str, dict[str, Any]] = {
 }
 COMMON_KEYS = {"enabled", "failures_before_alert", "every_seconds"}
 
-NOTIFIER_TYPES = {"ntfy", "webhook", "email"}
+NOTIFIER_KEYS = {
+    "ntfy": {"server", "topic", "token"},
+    "webhook": {"url", "format", "headers"},
+    "email": {"host", "port", "security", "username", "password", "from", "to"},
+}
+NOTIFIER_TYPES = set(NOTIFIER_KEYS)
 TOP_LEVEL_KEYS = {
     "home_assistant",
     "checks",
@@ -236,6 +259,7 @@ TOP_LEVEL_KEYS = {
     "recovery_command",
     "expiry",
     "phone_call",
+    "home_assistant_push",
 }
 
 
@@ -246,11 +270,55 @@ def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
+_TRUE = {"true", "yes", "on", "1"}
+_FALSE = {"false", "no", "off", "0", ""}
+
+
+def _bool(value: Any, where: str) -> bool:
+    """A real boolean. ``${VAR}`` always expands to a string, so "false" must mean False."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in _TRUE | _FALSE:
+        return value.strip().lower() in _TRUE
+    raise ConfigError(f"{where}: must be true or false, got {value!r}")
+
+
+def _coerce(default: Any, value: Any, where: str) -> Any:
+    """Turn harmless text into the default's type: "false" -> False, "8123" -> 8123, 20.0 -> 20.
+
+    Anything else is left alone for the validators to report.
+    """
+    if isinstance(default, bool):
+        return _bool(value, where)
+    if isinstance(value, bool) or not isinstance(default, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return value
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ConfigError(f"{where}: must be a finite number, got {value!r}")
+    if isinstance(value, float) and isinstance(default, int) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _str_list(value: Any, where: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ConfigError(f"{where}: must be a list of names, e.g. [a, b]")
+    return value
+
+
 def _build(cls: type, data: dict[str, Any], where: str) -> Any:
     allowed = set(cls.__dataclass_fields__)
     unknown = set(data) - allowed
     if unknown:
         raise ConfigError(f"{where}: unknown key(s) {', '.join(sorted(unknown))}")
+    data = dict(data)
+    for name, f in cls.__dataclass_fields__.items():
+        if name in data:
+            data[name] = _coerce(f.default, data[name], f"{where}.{name}")
     try:
         return cls(**data)
     except TypeError as exc:  # missing required field
@@ -259,9 +327,22 @@ def _build(cls: type, data: dict[str, Any], where: str) -> Any:
 
 def _positive(value: Any, where: str, allow_zero: bool = False) -> None:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ConfigError(f"{where}: must be a number")
+        raise ConfigError(f"{where}: must be a number, got {value!r}")
+    if not math.isfinite(value):
+        raise ConfigError(f"{where}: must be a finite number, got {value!r}")
     if value < 0 or (value == 0 and not allow_zero):
         raise ConfigError(f"{where}: must be {'>= 0' if allow_zero else '> 0'}")
+
+
+def _whole(value: Any, where: str, low: int, high: int | None = None) -> None:
+    if not isinstance(value, int) or isinstance(value, bool) or value < low or (high and value > high):
+        span = f"from {low} to {high}" if high else f">= {low}"
+        raise ConfigError(f"{where}: must be a whole number {span}, got {value!r}")
+
+
+def _text(value: Any, where: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{where}: must be a non-empty string")
 
 
 def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
@@ -279,9 +360,16 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     if not ha_raw.get("token"):
         raise ConfigError("home_assistant.token is required (use ${HA_TOKEN})")
     ha = _build(HomeAssistantConfig, ha_raw, "home_assistant")
-    ha.url = ha.url.rstrip("/")
+    _text(ha.url, "home_assistant.url")
+    _text(ha.token, "home_assistant.token")
+    ha.url = ha.url.strip().rstrip("/")
     if not ha.url.startswith(("http://", "https://")):
         raise ConfigError("home_assistant.url must start with http:// or https://")
+    _positive(ha.timeout_seconds, "home_assistant.timeout_seconds")
+    if isinstance(ha.ca_file, str) and not ha.ca_file.strip():
+        ha.ca_file = None  # ${HA_CA_FILE:-} left empty
+    if ha.ca_file is not None and not Path(ha.ca_file).is_file():
+        raise ConfigError(f"home_assistant.ca_file: {ha.ca_file} is not a readable file")
 
     checks: dict[str, CheckConfig] = {}
     checks_raw = _section(raw, "checks")
@@ -296,8 +384,15 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         extra = set(merged) - set(defaults) - COMMON_KEYS
         if extra:
             raise ConfigError(f"checks.{name}: unknown key(s) {', '.join(sorted(extra))}")
+        for key, default in {**defaults, "failures_before_alert": 1, "every_seconds": 0}.items():
+            if key not in merged:
+                continue
+            if isinstance(default, list):
+                _str_list(merged[key], f"checks.{name}.{key}")
+            else:
+                merged[key] = _coerce(default, merged[key], f"checks.{name}.{key}")
         fba = merged["failures_before_alert"]
-        if not isinstance(fba, int) or fba < 1:
+        if not isinstance(fba, int) or isinstance(fba, bool) or fba < 1:
             raise ConfigError(f"checks.{name}.failures_before_alert: must be an integer >= 1")
         _positive(merged.get("every_seconds", 0), f"checks.{name}.every_seconds", allow_zero=True)
         checks[name] = CheckConfig(
@@ -314,12 +409,15 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     for i, n in enumerate(notifiers):
         if not isinstance(n, dict) or n.get("type") not in NOTIFIER_TYPES:
             raise ConfigError(f"notifiers[{i}].type must be one of {sorted(NOTIFIER_TYPES)}")
+        unknown = set(n) - NOTIFIER_KEYS[n["type"]] - {"type"}
+        if unknown:
+            raise ConfigError(f"notifiers[{i}]: unknown key(s) {', '.join(sorted(unknown))}")
 
     cfg = Config(
         home_assistant=ha,
         checks=checks,
         notifiers=notifiers,
-        interval_seconds=raw.get("interval_seconds", 60),
+        interval_seconds=_coerce(60, raw.get("interval_seconds", 60), "interval_seconds"),
         state_file=raw.get("state_file", "ha-watcher-state.json"),
         name=raw.get("name", "Home Assistant"),
         alerts=_build(AlertConfig, _section(raw, "alerts"), "alerts"),
@@ -329,14 +427,31 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         recovery_command=_build(RecoveryCommandConfig, _section(raw, "recovery_command"), "recovery_command"),
         expiry=_build(ExpiryConfig, _section(raw, "expiry"), "expiry"),
         phone_call=_phone_call(_section(raw, "phone_call"), env),
+        home_assistant_push=_build(
+            HomeAssistantPushConfig, _section(raw, "home_assistant_push"), "home_assistant_push"
+        ),
     )
     _positive(cfg.interval_seconds, "interval_seconds")
+    _text(cfg.name, "name")
+    _text(cfg.state_file, "state_file")
     _positive(cfg.alerts.realert_minutes, "alerts.realert_minutes", allow_zero=True)
-    _positive(cfg.alerts.max_per_hour, "alerts.max_per_hour")
+    _whole(cfg.alerts.max_per_hour, "alerts.max_per_hour", 1)
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(cfg.heartbeat.time)):
         raise ConfigError("heartbeat.time must be HH:MM (24-hour, local time)")
+    _validate_deadman(cfg.deadman)
+    _validate_push(cfg.home_assistant_push)
     _validate_power(cfg.power_cycle, checks)
     _validate_recovery(cfg.recovery_command, checks)
+    if (
+        cfg.power_cycle.enabled
+        and cfg.recovery_command.enabled
+        and cfg.power_cycle.after_minutes <= cfg.recovery_command.after_minutes
+    ):
+        # The power cycle would cut the machine a loop after the gentle restart was sent.
+        raise ConfigError(
+            "power_cycle.after_minutes must be greater than recovery_command.after_minutes "
+            "(e.g. 10 and 30), so a restart gets time to work before the power is cut"
+        )
     _validate_expiry(cfg.expiry)
     _validate_phone_call(cfg.phone_call, checks)
     return cfg
@@ -360,6 +475,40 @@ def _validate_checks(checks: dict[str, CheckConfig]) -> None:
     if h.options["method"] not in ("tcp", "ping"):
         raise ConfigError("checks.host.method must be 'tcp' or 'ping'")
     _positive(checks["api"].options["max_response_ms"], "checks.api.max_response_ms")
+    _positive(m.options["max_percent"], "checks.memory.max_percent")
+    _whole(h.options["port"], "checks.host.port", 1, 65535)
+    _positive(h.options["timeout_seconds"], "checks.host.timeout_seconds")
+    _text(b.options["sensor_entity"], "checks.backup.sensor_entity")
+
+
+def _validate_push(p: HomeAssistantPushConfig) -> None:
+    for key in ("url", "secret"):
+        value = getattr(p, key)
+        if value is not None and not isinstance(value, str):
+            raise ConfigError(f"home_assistant_push.{key}: must be text")
+        if isinstance(value, str) and not value.strip():
+            setattr(p, key, None)  # ${VAR:-} left empty: off / unsigned
+    if p.secret is not None and len(p.secret) < 16:
+        raise ConfigError(
+            "home_assistant_push.secret: must be at least 16 characters (the integration refuses shorter)"
+        )
+    if p.url and not p.url.startswith(("http://", "https://")):
+        raise ConfigError(
+            "home_assistant_push.url must be the webhook URL shown by the integration (http:// or https://)"
+        )
+    _whole(p.every_seconds, "home_assistant_push.every_seconds", 1, 86400)
+    _positive(p.timeout_seconds, "home_assistant_push.timeout_seconds")
+    if p.timeout_seconds > 30:
+        raise ConfigError("home_assistant_push.timeout_seconds: at most 30, so a push cannot stall the loop")
+    if p.watcher_id is not None and not isinstance(p.watcher_id, str):
+        raise ConfigError("home_assistant_push.watcher_id: must be text")
+    p.watcher_id = ((p.watcher_id or "").strip() or socket.gethostname() or "ha-watcher")[:128]
+
+
+def _validate_deadman(d: DeadmanConfig) -> None:
+    if d.url and not (isinstance(d.url, str) and d.url.startswith(("http://", "https://"))):
+        raise ConfigError("deadman.url must start with http:// or https:// (or be empty for off)")
+    _positive(d.every_seconds, "deadman.every_seconds")
 
 
 def _validate_power(p: PowerCycleConfig, checks: dict[str, CheckConfig]) -> None:
@@ -367,8 +516,11 @@ def _validate_power(p: PowerCycleConfig, checks: dict[str, CheckConfig]) -> None
         return
     if p.driver not in ("shelly", "kasa"):
         raise ConfigError("power_cycle.driver must be 'shelly' or 'kasa'")
-    if not p.host:
+    if not p.host or not isinstance(p.host, str):
         raise ConfigError("power_cycle.host is required when power_cycle is enabled")
+    _whole(p.switch_id, "power_cycle.switch_id", 0)
+    if not _str_list(p.trigger_checks, "power_cycle.trigger_checks"):
+        raise ConfigError("power_cycle.trigger_checks: list at least one check")
     for name in p.trigger_checks:
         if name not in checks or not checks[name].enabled:
             raise ConfigError(f"power_cycle.trigger_checks: '{name}' is not an enabled check")
@@ -387,8 +539,9 @@ def _validate_recovery(r: RecoveryCommandConfig, checks: dict[str, CheckConfig])
         or not all(isinstance(a, str) and a for a in r.command)
     ):
         raise ConfigError("recovery_command.command must be a non-empty list of strings (argv, no shell)")
-    if not r.trigger_checks:
+    if not _str_list(r.trigger_checks, "recovery_command.trigger_checks"):
         raise ConfigError("recovery_command.trigger_checks: list at least one check")
+    _str_list(r.only_if_passing, "recovery_command.only_if_passing")
     for key in ("trigger_checks", "only_if_passing"):
         for name in getattr(r, key):
             if name not in checks or not checks[name].enabled:
@@ -475,7 +628,7 @@ def _validate_phone_call(p: PhoneCallConfig, checks: dict[str, CheckConfig]) -> 
     ):
         if not _PHONE_RE.fullmatch(number):
             raise ConfigError(f"{name} must be in +E.164 form, e.g. +15555550100")
-    if not p.trigger_checks:
+    if not _str_list(p.trigger_checks, "phone_call.trigger_checks"):
         raise ConfigError("phone_call.trigger_checks: list at least one check")
     for name in p.trigger_checks:
         if name not in checks or not checks[name].enabled:

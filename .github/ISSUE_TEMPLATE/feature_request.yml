@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest a check, notifier or behaviour change.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would it solve?
+      description: The outage or situation you want caught or handled, and how you handle it today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like ha-watcher to do?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: For example a Home Assistant automation, Uptime Kuma, Gatus. ha-watcher stays small on purpose.

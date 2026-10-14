@@ -5,17 +5,21 @@ from __future__ import annotations
 import argparse
 import logging
 import shutil
+import signal
 import sys
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 
-from ha_watcher import __version__
+from ha_watcher import __version__, power
 from ha_watcher.config import TWILIO_ENV, Config, ConfigError, load_config
 from ha_watcher.engine import Watcher
 from ha_watcher.escalation import CallError, place_call
 from ha_watcher.ha import HAClient
 from ha_watcher.notifiers import Message, build_notifiers, send_all
 from ha_watcher.power import PowerError, build_driver
+from ha_watcher.state import load_state, parse
 
 log = logging.getLogger("ha_watcher")
 
@@ -28,6 +32,35 @@ def build_watcher(cfg: Config) -> Watcher:
     notifiers = build_notifiers(cfg.notifiers, http)
     driver = build_driver(cfg.power_cycle) if cfg.power_cycle.enabled else None
     return Watcher(cfg, HAClient(cfg.home_assistant), notifiers, http, driver=driver)
+
+
+def _exit_on_sigterm(watcher: Any = None) -> None:
+    """Stop cleanly on SIGTERM (systemd, docker stop). As PID 1 in a container Python
+    would otherwise ignore it and be killed 10 seconds later. During a power cycle the
+    stop waits for the cycle to finish, so the host is never left switched off."""
+
+    def handler(signum: int, frame: Any) -> None:
+        if power.cycle_in_progress():
+            log.warning("stop requested; finishing the power cycle first")
+            if watcher is not None:
+                watcher.stop_requested = True
+            return
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handler)
+
+
+def _health(cfg: Config) -> int:
+    """For a container HEALTHCHECK: did the watcher save a finished loop recently?"""
+    last = parse(load_state(cfg.state_file).get("last_loop"))
+    limit = max(timedelta(minutes=5), timedelta(seconds=3 * cfg.interval_seconds))
+    age = datetime.now(UTC) - last if last else None
+    if age is None or age > limit:
+        when = f"{int(age.total_seconds())}s ago" if age else "never"
+        print(f"unhealthy: last loop finished {when} (limit {int(limit.total_seconds())}s)", file=sys.stderr)
+        return 1
+    print(f"healthy: last loop finished {int(age.total_seconds())}s ago")
+    return 0
 
 
 def summarize(cfg: Config) -> str:
@@ -57,6 +90,13 @@ def summarize(cfg: Config) -> str:
     else:
         lines.append("Recovery command: off")
     lines.append(_phone_summary(cfg))
+    hp = cfg.home_assistant_push
+    lines.append(
+        f"Home Assistant status push: every {hp.every_seconds}s as {hp.watcher_id}"
+        f"{', signed' if hp.secret else ''}"
+        if hp.enabled
+        else "Home Assistant status push: off (no home_assistant_push.url)"
+    )
     ex = cfg.expiry
     if ex.tls_hosts or ex.domains:
         lines.append(
@@ -90,6 +130,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--once", action="store_true", help="run every check once, print, exit")
     mode.add_argument("--test-notify", action="store_true", help="send a test message to every notifier")
     mode.add_argument("--test-call", action="store_true", help="place one test phone call through Twilio")
+    mode.add_argument(
+        "--health", action="store_true", help="exit 0 if the running watcher finished a loop recently"
+    )
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
@@ -106,8 +149,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
 
+    if args.health:
+        return _health(cfg)
+
     if args.check_config:
         try:
+            HAClient(cfg.home_assistant).close()  # loads ca_file, if any
             build_notifiers(cfg.notifiers, httpx.Client())
             if cfg.power_cycle.enabled:
                 build_driver(cfg.power_cycle)
@@ -117,6 +164,9 @@ def main(argv: list[str] | None = None) -> int:
         except (ValueError, PowerError) as exc:
             print(f"config error: {exc}", file=sys.stderr)
             return 2
+        except OSError as exc:  # includes ssl.SSLError from a bad ca_file
+            print(f"config error: home_assistant.ca_file: {type(exc).__name__}", file=sys.stderr)
+            return 2
         print("Config OK\n" + summarize(cfg))
         return 0
 
@@ -124,6 +174,9 @@ def main(argv: list[str] | None = None) -> int:
         watcher = build_watcher(cfg)
     except (ValueError, PowerError) as exc:
         print(f"config error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:  # includes ssl.SSLError from a bad ca_file
+        print(f"config error: home_assistant.ca_file: {type(exc).__name__}", file=sys.stderr)
         return 2
 
     if args.test_call:
@@ -145,11 +198,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if sent == len(watcher.notifiers) else 1
 
     if args.once:
+        watcher.oneshot = True
         results = watcher.run_once()
         for r in results:
             print(f"{'OK  ' if r.ok else 'FAIL'} {r.key:<32} {r.message}")
         return 0 if all(r.ok for r in results) else 1
 
+    _exit_on_sigterm(watcher)
     try:
         watcher.run_forever()
     except KeyboardInterrupt:

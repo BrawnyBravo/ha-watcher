@@ -130,3 +130,89 @@ def test_test_call_refuses_without_twilio(tmp_path, monkeypatch, capsys):
     p = write_cfg(tmp_path, MINIMAL)
     assert cli.main(["--test-call", "-c", str(p)]) == 2
     assert "Phone call: off" in capsys.readouterr().err
+
+
+def test_check_config_rejects_a_ca_file_that_is_not_a_certificate(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HA_TOKEN", "x")
+    ca = tmp_path / "ca.pem"
+    ca.write_text("not a certificate", encoding="utf-8")
+    text = MINIMAL.replace("token: ${HA_TOKEN}", f"token: ${{HA_TOKEN}}\n  ca_file: {ca.as_posix()}")
+    p = write_cfg(tmp_path, text)
+    assert cli.main(["--check-config", "-c", str(p)]) == 2
+    assert "ca_file" in capsys.readouterr().err
+
+
+def test_check_config_rejects_unknown_notifier_keys(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HA_TOKEN", "x")
+    p = write_cfg(tmp_path, MINIMAL + "notifiers:\n  - type: ntfy\n    topic: t\n    priority: max\n")
+    assert cli.main(["--check-config", "-c", str(p)]) == 2
+    assert "notifiers[0]: unknown key(s) priority" in capsys.readouterr().err
+
+
+def test_sigterm_ends_the_process_cleanly(monkeypatch):
+    import signal
+
+    seen = {}
+    monkeypatch.setattr(signal, "signal", lambda sig, fn: seen.setdefault(sig, fn))
+    cli._exit_on_sigterm()
+    try:
+        seen[signal.SIGTERM](signal.SIGTERM, None)
+    except SystemExit as exc:
+        assert exc.code == 0
+    else:
+        raise AssertionError("SIGTERM handler did not exit")
+
+
+def test_health_reports_a_stale_or_missing_loop(tmp_path, monkeypatch, capsys):
+    import json
+    from datetime import datetime, timedelta
+
+    monkeypatch.setenv("HA_TOKEN", "x")
+    state = tmp_path / "state.json"
+    p = write_cfg(tmp_path, MINIMAL.replace("STATE", state.as_posix()))
+    assert cli.main(["--health", "-c", str(p)]) == 1  # no loop has run yet
+    now = datetime.now(UTC)
+    state.write_text(json.dumps({"version": 1, "last_loop": now.isoformat()}), encoding="utf-8")
+    assert cli.main(["--health", "-c", str(p)]) == 0
+    old = now - timedelta(minutes=10)
+    state.write_text(json.dumps({"version": 1, "last_loop": old.isoformat()}), encoding="utf-8")
+    assert cli.main(["--health", "-c", str(p)]) == 1
+    assert "last loop" in capsys.readouterr().err
+
+
+def test_sigterm_during_a_power_cycle_waits_for_it(monkeypatch):
+    import signal
+
+    from ha_watcher import power
+
+    class W:
+        stop_requested = False
+
+    seen = {}
+    monkeypatch.setattr(signal, "signal", lambda sig, fn: seen.setdefault(sig, fn))
+    w = W()
+    cli._exit_on_sigterm(w)
+    monkeypatch.setattr(power, "_cycling", True)
+    seen[signal.SIGTERM](signal.SIGTERM, None)  # no SystemExit mid-cycle
+    assert w.stop_requested is True
+
+
+def test_main_installs_the_sigterm_handler(tmp_path, monkeypatch):
+    import signal
+
+    monkeypatch.setenv("HA_TOKEN", "x")
+    p = write_cfg(tmp_path, MINIMAL.replace("STATE", (tmp_path / "s.json").as_posix()))
+    seen = {}
+    monkeypatch.setattr(signal, "signal", lambda sig, fn: seen.setdefault(sig, fn))
+    monkeypatch.setattr(Watcher, "run_forever", lambda self: None)
+    assert cli.main(["-c", str(p)]) == 0
+    assert signal.SIGTERM in seen
+
+
+def test_once_mode_marks_the_watcher_as_oneshot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HA_TOKEN", "x")
+    p = write_cfg(tmp_path, MINIMAL.replace("STATE", (tmp_path / "s.json").as_posix()))
+    seen = []
+    monkeypatch.setattr(Watcher, "run_once", lambda self, now=None: seen.append(self.oneshot) or [])
+    cli.main(["--once", "-c", str(p)])
+    assert seen == [True]

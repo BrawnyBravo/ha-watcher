@@ -26,6 +26,7 @@ import httpx
 from ha_watcher import __version__
 from ha_watcher.checks import parse_ts
 from ha_watcher.config import ExpiryConfig, split_host
+from ha_watcher.deadline import Bounded
 from ha_watcher.notifiers import Message
 from ha_watcher.state import parse, ts
 
@@ -39,6 +40,8 @@ TLS_RETRY_AFTER_FAILURE = timedelta(hours=1)
 RDAP_RETRY_AFTER_FAILURE = timedelta(hours=6)
 RATE_LIMIT_BACKOFF = timedelta(hours=24)
 X509_V_ERR_CERT_HAS_EXPIRED = 10
+_RDAP_LIMIT = Bounded("RDAP")
+_TLS_LIMIT = Bounded("certificate lookup")
 
 
 class LookupFailed(Exception):  # noqa: N818 - reads better at the call site
@@ -119,7 +122,9 @@ def _retry_after(response: httpx.Response) -> timedelta:
 
 def _rdap_get(http: httpx.Client, url: str, timeout: float) -> Any:
     try:
-        r = http.get(
+        r = _RDAP_LIMIT.call(
+            timeout * 2 + 1,
+            http.get,
             url,
             headers={"Accept": "application/rdap+json, application/json", "User-Agent": USER_AGENT},
             timeout=timeout,
@@ -214,7 +219,11 @@ class ExpiryWatch:
         return now - last >= wait
 
     def _cert(self, host: str, port: int) -> datetime | None:
-        return self.cert_lookup(host, port, float(self.cfg.timeout_seconds))
+        timeout = float(self.cfg.timeout_seconds)
+        try:
+            return _TLS_LIMIT.call(timeout * 2 + 1, self.cert_lookup, host, port, timeout)
+        except httpx.TimeoutException:
+            raise LookupFailed("cannot connect (no complete answer in time)") from None
 
     def _rdap(self, domain: str, now: datetime) -> datetime:
         base = self._rdap_server(domain, now)

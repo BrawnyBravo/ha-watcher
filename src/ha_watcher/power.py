@@ -7,6 +7,7 @@ Off by default. Guarded by a minimum outage length, a cooldown, a daily cap, and
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from typing import Any
 import httpx
 
 from ha_watcher.config import PowerCycleConfig
+from ha_watcher.deadline import Bounded
 
 
 class PowerError(Exception):
@@ -33,6 +35,7 @@ class ShellyGen2Driver:
             auth = httpx.DigestAuth(cfg.username or "admin", cfg.password)
         host = cfg.host if cfg.host.startswith("http") else f"http://{cfg.host}"
         self.http = httpx.Client(base_url=host, auth=auth, timeout=10, transport=transport)
+        self.limit = Bounded("Shelly")
 
     def power_cycle(self, off_seconds: int) -> None:
         body = {
@@ -41,14 +44,20 @@ class ShellyGen2Driver:
             "params": {"id": self.cfg.switch_id, "on": False, "toggle_after": off_seconds},
         }
         try:
-            resp = self.http.post("/rpc", json=body)
+            resp = self.limit.call(25, self.http.post, "/rpc", json=body)
         except httpx.HTTPError as exc:
             raise PowerError(f"Shelly unreachable: {type(exc).__name__}") from exc
         if resp.status_code != 200:
             raise PowerError(f"Shelly returned HTTP {resp.status_code}")
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError:
+            raise PowerError("Shelly reply not understood (is this a Gen2 or newer device?)") from None
+        if not isinstance(data, dict):
+            raise PowerError("Shelly reply not understood")
         if "error" in data:
-            raise PowerError(f"Shelly error: {data['error'].get('message', data['error'])}")
+            err = data["error"]
+            raise PowerError(f"Shelly error: {err.get('message', err) if isinstance(err, dict) else err}")
 
 
 class KasaDriver:
@@ -59,8 +68,10 @@ class KasaDriver:
         cfg: PowerCycleConfig,
         discover: Callable[..., Any] | None = None,
         sleep: Callable[[float], Any] | None = None,
+        step_timeout: float = 20.0,
     ) -> None:
         self.cfg = cfg
+        self.step_timeout = step_timeout  # every network step is bounded, so a cycle cannot hang
         if discover is None:
             try:
                 from kasa import Discover
@@ -71,24 +82,41 @@ class KasaDriver:
         self.sleep = sleep or asyncio.sleep
 
     async def _cycle(self, off_seconds: int) -> None:
-        dev = await self.discover(self.cfg.host, username=self.cfg.username, password=self.cfg.password)
+        def bounded(aw: Any) -> Any:
+            return asyncio.wait_for(aw, self.step_timeout)
+
+        dev = await bounded(
+            self.discover(self.cfg.host, username=self.cfg.username, password=self.cfg.password)
+        )
         if dev is None:
             raise PowerError("Kasa device not found")
         try:
-            await dev.update()
-            await dev.turn_off()
+            await bounded(dev.update())
+            off_error: Exception | None = None
+            try:
+                await bounded(dev.turn_off())
+            except Exception as exc:  # noqa: BLE001 - the plug may have switched off anyway
+                off_error = exc
             await self.sleep(off_seconds)
             last: Exception | None = None
             for _ in range(3):  # Kasa cannot switch itself back on, so try hard
                 try:
-                    await dev.turn_on()
-                    return
+                    await bounded(dev.turn_on())
+                    break
                 except Exception as exc:  # noqa: BLE001
                     last = exc
                     await self.sleep(2)
-            raise PowerError(f"Kasa plug did not turn back on: {type(last).__name__}")
+            else:
+                raise PowerError(
+                    f"Kasa plug did not turn back on ({type(last).__name__}): the host may be OFF"
+                )
+            if off_error is not None:
+                raise PowerError(
+                    f"Kasa turn-off did not confirm ({type(off_error).__name__}); turn-on was sent"
+                )
         finally:
-            await dev.disconnect()
+            with contextlib.suppress(Exception):  # the cycle itself is what matters
+                await bounded(dev.disconnect())
 
     def power_cycle(self, off_seconds: int) -> None:
         try:
@@ -136,9 +164,26 @@ def decide(
     return Decision(True, f"down for {int(down.total_seconds() // 60)}m")
 
 
+_cycling = False
+
+
+def cycle_in_progress() -> bool:
+    """True while the plug is being switched; a stop request must wait for it."""
+    return _cycling
+
+
 def run_cycle(driver: Any, cfg: PowerCycleConfig) -> str:
+    global _cycling
     if cfg.dry_run:
         return "dry run: would have power-cycled the host"
     start = time.monotonic()
-    driver.power_cycle(cfg.off_seconds)
+    _cycling = True
+    try:
+        driver.power_cycle(cfg.off_seconds)
+    except PowerError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any driver trouble is a failed attempt
+        raise PowerError(f"power cycle failed: {type(exc).__name__}") from exc
+    finally:
+        _cycling = False
     return f"power-cycled the host (off {cfg.off_seconds}s, took {time.monotonic() - start:.0f}s)"
