@@ -74,6 +74,13 @@ The first release meant for anyone to install and rely on. Everything from the u
 
 ### Added
 
+- `home_assistant_push`: an optional status report every `every_seconds` (default 60) to
+  the HA Watcher companion integration, following its payload contract v1: check names
+  mapped to `[a-z0-9_]{1,40}` (sorted, shortened with a hash when too long or taken), at
+  most 32 checks (the first 32 in sorted order), body under 64 KiB, counts capped at 10^9,
+  optional HMAC-SHA256 signing with `secret`. Off unless `url` is set; the URL and secret
+  are never logged; a failed report is logged once per failure streak and never affects
+  alerts.
 - `--health`: exits 0 when the running watcher saved a loop within max(5 minutes,
   3 x `interval_seconds`). The Docker image uses it as its `HEALTHCHECK`.
 - Release workflow: on a `vX.Y.Z` tag, tests, publishes to PyPI through trusted publishing,

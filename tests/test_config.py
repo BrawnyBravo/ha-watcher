@@ -198,6 +198,7 @@ def test_example_config_lists_every_option():
         "recovery_command": c.RecoveryCommandConfig,
         "expiry": c.ExpiryConfig,
         "phone_call": c.PhoneCallConfig,
+        "home_assistant_push": c.HomeAssistantPushConfig,
     }
     missing = [
         f"{name}.{key}"

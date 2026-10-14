@@ -17,6 +17,7 @@ from ha_watcher.escalation import PhoneEscalation
 from ha_watcher.expiry import ExpiryWatch
 from ha_watcher.ha import HAClient, HAError
 from ha_watcher.notifiers import Message, Notifier, send_all
+from ha_watcher.push import StatusPush
 from ha_watcher.state import load_state, parse, save_state, ts
 
 log = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ class Watcher:
         self.oneshot = False  # --once: each run is its own process, often minutes apart (cron)
         self.stop_requested = False  # set by the SIGTERM handler during a power cycle
         self._delivery_failing = False  # log delivery failures loudly once per streak
+        self.push = StatusPush(self, http)
 
     # ------------------------------------------------------------------ public
     def run_once(self, now: datetime | None = None) -> list[Result]:
@@ -102,6 +104,7 @@ class Watcher:
         self.expiry.run(now)
         self._step("heartbeat", self._heartbeat, now)
         self._step("dead-man ping", self._deadman, now)
+        self._step("status push", self.push.run, now)
         save_state(self.state_path, self.state)
         return results
 
@@ -172,6 +175,7 @@ class Watcher:
             phone["called_outage"] = ts(self._down_since(self.cfg.phone_call.trigger_checks))
         for holder, key in (
             (self.state, "alert_times"),
+            (self.state, "alerts_24h"),
             (self.state["power"], "cycles"),
             (self.state["power"], "dry_cycles"),
             (self.state["recovery"], "runs"),
@@ -186,7 +190,7 @@ class Watcher:
             (self.state["expiry"], "rdap_backoff_until"),
             *((self.state["last_run"], k) for k in self.state["last_run"]),
             *((item, "checked") for item in self.state["expiry"]["items"].values()),
-            *((st, "retry_at") for st in self.state["checks"].values()),
+            *((st, k) for st in self.state["checks"].values() for k in ("retry_at", "since")),
         ]
         for holder, key in singles:
             if holder.get(key) and parse(holder[key]) > now:
@@ -237,6 +241,7 @@ class Watcher:
     ) -> tuple[list[tuple[str, str, str | None]], list[str]]:
         """Debounce the results. Alerts come back as (key, text, previous last_alert)."""
         checks = self.state["checks"]
+        before = {k: v["ok"] for k, v in checks.items()}
         alerts: list[tuple[str, str, str | None]] = []
         recoveries: list[str] = []
         realert = timedelta(minutes=self.cfg.alerts.realert_minutes)
@@ -298,6 +303,12 @@ class Watcher:
                 text = f"Still failing for {fmt_age((now - first).total_seconds())}: {r.message}"
                 alerts.append((r.key, text, previous))
 
+        # When each key entered its current ok/failing state (for the status push).
+        for key in seen:
+            st = checks.get(key)
+            if st is not None and (key not in before or before[key] != st["ok"] or not st.get("since")):
+                st["since"] = ts(now)
+
         # A key that a check stopped reporting (e.g. a "cannot query" error that cleared,
         # or an entity removed from the config) counts as resolved.
         for key in [k for k, v in checks.items() if v["check"] in ran and k not in seen]:
@@ -346,6 +357,9 @@ class Watcher:
         self._delivery_failing = False
         self.state["suppressed"] = 0
         self.state["alert_times"].append(ts(now))
+        if msg.severity == "alert":
+            self.state["alerts_24h"].append(ts(now))
+            self.state["alerts_24h"] = self.state["alerts_24h"][-1000:]
         return True
 
     def _deliver(

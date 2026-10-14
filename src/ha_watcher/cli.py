@@ -90,6 +90,13 @@ def summarize(cfg: Config) -> str:
     else:
         lines.append("Recovery command: off")
     lines.append(_phone_summary(cfg))
+    hp = cfg.home_assistant_push
+    lines.append(
+        f"Home Assistant status push: every {hp.every_seconds}s as {hp.watcher_id}"
+        f"{', signed' if hp.secret else ''}"
+        if hp.enabled
+        else "Home Assistant status push: off (no home_assistant_push.url)"
+    )
     ex = cfg.expiry
     if ex.tls_hosts or ex.domains:
         lines.append(

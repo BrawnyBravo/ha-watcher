@@ -133,3 +133,10 @@ phone_call:                    # voice call through Twilio when HA stays down. S
   max_per_day: 2               # rolling 24 h, failed attempts included
   retry_minutes: 10            # wait after a failed call attempt
   message: "This is the {name} watcher. {name} has been down for {minutes} minutes. Please check it."
+
+home_assistant_push:           # status reports to the HA Watcher integration; OFF unless url is set
+  url: ${HA_PUSH_URL:-}        # the webhook URL the integration shows; it is a secret
+  every_seconds: 60            # keep well under half the integration's offline timeout
+  timeout_seconds: 10          # per report, at most 30; a failed report is dropped
+  secret: ${HA_PUSH_SECRET:-}  # optional: signs each report (HMAC-SHA256) when set
+  watcher_id: ""               # empty = this machine's host name

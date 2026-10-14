@@ -47,6 +47,8 @@ Also:
 - Optional **phone call** through Twilio when Home Assistant has been down for 30 minutes
   (configurable) and has not come back: once per outage, at most twice a day. **Off unless
   the Twilio environment variables are set**; see "Phone call escalation" below.
+- Optional **status push** to the [HA Watcher integration](https://github.com/BrawnyBravo/ha-watcher-companion),
+  so Home Assistant shows the watcher's checks as entities (`home_assistant_push`).
 - One YAML file, secrets from environment variables, a JSON state file written atomically,
   `--check-config`, `--once`, `--test-notify`, `--test-call` and `--health` modes.
 
@@ -358,6 +360,36 @@ The account and numbers come from the environment only (`TWILIO_ACCOUNT_SID`,
 `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `TWILIO_TO_NUMBER`); a `twilio` key in the file
 is an error. `--check-config` says whether calls are on, or which variables are missing,
 without printing their values.
+
+### `home_assistant_push`
+
+Off unless `url` is set. See "Home Assistant companion" below.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `url` | none | The webhook URL the HA Watcher integration shows when it is added. It is a secret: anyone who has it can post reports. Use `${HA_PUSH_URL}`. Empty = off. |
+| `every_seconds` | `60` | Seconds between reports. Keep it well under half the integration's offline timeout (default 5 minutes). |
+| `timeout_seconds` | `10` | Per report, at most 30. |
+| `secret` | none | Optional shared secret. When set, each report carries `X-HA-Watcher-Timestamp` and `X-HA-Watcher-Signature: sha256=<HMAC-SHA256 of "timestamp.body">`; set the same secret in the integration. Use `${HA_PUSH_SECRET}`. |
+| `watcher_id` | host name | Stable id for this watcher install. |
+
+## Home Assistant companion
+
+The optional [HA Watcher integration](https://github.com/BrawnyBravo/ha-watcher-companion)
+shows the watcher inside Home Assistant: one problem sensor per check, the watcher's
+version and an "online" sensor that turns off when reports stop. Add the integration in
+Home Assistant, copy the webhook URL it shows into `home_assistant_push.url` (through the
+env file), and restart the watcher.
+
+This is a convenience, not part of the alerting: reports go to Home Assistant, which is
+exactly what may be down. A failed report is dropped and logged once until reports work
+again; it never delays or changes an alert. Reports follow the integration's payload
+contract (version 1): check names are lowercased with anything outside `a-z0-9_` turned
+into `_` (`core:safe_mode` becomes `core_safe_mode`), names longer than 40 characters or
+already taken are shortened with a hash, and at most 32 checks are sent, the first 32 in
+sorted order of their keys, so the same ones every time (the integration creates at most
+32 entities per install). Many `entities` or add-ons can therefore push some checks past
+the 32nd; alerts still cover them.
 
 ## Phone call escalation
 

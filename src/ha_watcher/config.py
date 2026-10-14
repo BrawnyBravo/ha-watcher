@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -129,6 +130,21 @@ class ExpiryConfig:
     failed_lookups_before_alert: int = 3  # retries: TLS after 1 h, RDAP after 6 h
 
 
+@dataclass
+class HomeAssistantPushConfig:
+    """Status reports to the HA Watcher companion integration. Off unless url is set."""
+
+    url: str | None = field(default=None, repr=False)  # the webhook URL is a secret
+    every_seconds: int = 60
+    timeout_seconds: float = 10.0
+    secret: str | None = field(default=None, repr=False)  # optional HMAC signing key
+    watcher_id: str | None = None  # default: this machine's host name
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.url)
+
+
 TWILIO_ENV = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "TWILIO_TO_NUMBER")
 
 
@@ -173,6 +189,7 @@ class Config:
     recovery_command: RecoveryCommandConfig = field(default_factory=RecoveryCommandConfig)
     expiry: ExpiryConfig = field(default_factory=ExpiryConfig)
     phone_call: PhoneCallConfig = field(default_factory=PhoneCallConfig)
+    home_assistant_push: HomeAssistantPushConfig = field(default_factory=HomeAssistantPushConfig)
 
 
 # Defaults for each check. Anything not listed in COMMON_KEYS is check-specific.
@@ -241,6 +258,7 @@ TOP_LEVEL_KEYS = {
     "recovery_command",
     "expiry",
     "phone_call",
+    "home_assistant_push",
 }
 
 
@@ -404,6 +422,9 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         recovery_command=_build(RecoveryCommandConfig, _section(raw, "recovery_command"), "recovery_command"),
         expiry=_build(ExpiryConfig, _section(raw, "expiry"), "expiry"),
         phone_call=_phone_call(_section(raw, "phone_call"), env),
+        home_assistant_push=_build(
+            HomeAssistantPushConfig, _section(raw, "home_assistant_push"), "home_assistant_push"
+        ),
     )
     _positive(cfg.interval_seconds, "interval_seconds")
     _text(cfg.name, "name")
@@ -413,6 +434,7 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", str(cfg.heartbeat.time)):
         raise ConfigError("heartbeat.time must be HH:MM (24-hour, local time)")
     _validate_deadman(cfg.deadman)
+    _validate_push(cfg.home_assistant_push)
     _validate_power(cfg.power_cycle, checks)
     _validate_recovery(cfg.recovery_command, checks)
     if (
@@ -452,6 +474,26 @@ def _validate_checks(checks: dict[str, CheckConfig]) -> None:
     _whole(h.options["port"], "checks.host.port", 1, 65535)
     _positive(h.options["timeout_seconds"], "checks.host.timeout_seconds")
     _text(b.options["sensor_entity"], "checks.backup.sensor_entity")
+
+
+def _validate_push(p: HomeAssistantPushConfig) -> None:
+    for key in ("url", "secret"):
+        value = getattr(p, key)
+        if value is not None and not isinstance(value, str):
+            raise ConfigError(f"home_assistant_push.{key}: must be text")
+        if isinstance(value, str) and not value.strip():
+            setattr(p, key, None)  # ${VAR:-} left empty: off / unsigned
+    if p.url and not p.url.startswith(("http://", "https://")):
+        raise ConfigError(
+            "home_assistant_push.url must be the webhook URL shown by the integration (http:// or https://)"
+        )
+    _whole(p.every_seconds, "home_assistant_push.every_seconds", 1)
+    _positive(p.timeout_seconds, "home_assistant_push.timeout_seconds")
+    if p.timeout_seconds > 30:
+        raise ConfigError("home_assistant_push.timeout_seconds: at most 30, so a push cannot stall the loop")
+    if p.watcher_id is not None and not isinstance(p.watcher_id, str):
+        raise ConfigError("home_assistant_push.watcher_id: must be text")
+    p.watcher_id = ((p.watcher_id or "").strip() or socket.gethostname() or "ha-watcher")[:128]
 
 
 def _validate_deadman(d: DeadmanConfig) -> None:

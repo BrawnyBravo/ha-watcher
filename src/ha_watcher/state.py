@@ -21,6 +21,7 @@ def empty_state() -> dict[str, Any]:
         "checks": {},
         "last_run": {},
         "alert_times": [],
+        "alerts_24h": [],  # alert messages delivered, for the status push
         "suppressed": 0,
         "heartbeat_last": None,
         "deadman_last": None,
@@ -57,6 +58,7 @@ def load_state(path: str | Path) -> dict[str, Any]:
 CHECK_KEYS = {"check": str, "ok": bool, "failures": int, "alerting": bool, "message": str}
 TIME_LISTS = {
     ("alert_times",),
+    ("alerts_24h",),
     ("power", "cycles"),
     ("power", "dry_cycles"),
     ("recovery", "runs"),
@@ -105,6 +107,7 @@ def _sanitize(data: dict[str, Any]) -> dict[str, Any]:
         and _time_or_none(v.get("last_alert"))
         and _time_or_none(v.get("held_since"))
         and _time_or_none(v.get("retry_at"))
+        and _time_or_none(v.get("since"))
     }
     base["last_run"] = {k: v for k, v in base["last_run"].items() if _aware(v)}
     for path in TIME_LISTS:
