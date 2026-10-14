@@ -4,7 +4,73 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.0] - unreleased (set the date when tagging v1.0.0)
+
+The first release meant for anyone to install and rely on. Everything from the unreleased
+0.x work below is included.
+
+### Upgrading from 0.1.0
+
+- The state file carries over. Older files are read as before, and parts with a wrong type
+  are reset one by one instead of discarding the file or crashing.
+- Config checks are stricter, so a config that 0.1.0 accepted may now be refused with a
+  message naming the key. Run `ha-watcher --check-config` before restarting the service:
+  - `power_cycle.after_minutes` must be greater than `recovery_command.after_minutes` when
+    both are enabled.
+  - Unknown keys in a notifier are errors.
+  - On/off settings must be `true`/`false` (strings from `${VAR}` such as `"false"` or
+    `"no"` are understood); other values are errors.
+  - Lists (`entity_ids`, `addons`, `trigger_checks`, `only_if_passing`) must be lists, ports
+    and timeouts must be valid numbers, `ca_file` must exist and hold a certificate, and
+    `deadman.url` must start with `http://` or `https://`.
+
+### Fixed
+
+- `"false"` from an environment variable (for example `enabled: ${POWER_CYCLE:-false}`)
+  counted as on, because any non-empty string was treated as true. On/off settings are
+  now parsed properly.
+- An alert held back by the rate limit was marked as sent and, with `realert_minutes: 0`,
+  never delivered. It now goes out on the first loop with room.
+- An alert that no notifier accepted (network down at that moment) was marked as sent. It
+  is now retried every loop until one notifier takes it.
+- A dry-run power cycle or recovery command sent a message on every loop once the outage
+  passed `after_minutes`. Dry runs now follow the same cooldown and daily cap.
+- A power-cycle driver error other than the expected kind (for example a Shelly answering
+  with something that is not JSON) skipped the attempt counter, so the guard allowed
+  another cycle on the next loop. Every attempt is now counted and saved before the plug
+  is touched.
+- After the watcher had not been running for a while, or after the system clock jumped (a
+  Raspberry Pi sets its clock from the network after boot), an old outage start time could
+  make the recovery command or power cycle fire at once, possibly while Home Assistant
+  was still booting. Outage timers now restart in both cases.
+- A state file naming a check that this version does not know made every loop fail.
+- A crash in one step of a loop (delivery, recovery actions, heartbeat) skipped the rest of
+  that loop, including the dead-man ping and the state save. Steps are now isolated.
+- A Kasa plug that stopped answering could hang the watcher; every Kasa network step is
+  now limited to 20 seconds.
+- A bad `ca_file` crashed at start-up with a traceback; it is now a config error, also
+  reported by `--check-config`.
+- The container ignored `docker stop` (Python as PID 1 ignores SIGTERM) and was killed
+  after the timeout. SIGTERM now ends it at once.
+
+### Added
+
+- `--health`: exits 0 when the running watcher saved a loop within max(5 minutes,
+  3 x `interval_seconds`). The Docker image uses it as its `HEALTHCHECK`.
+- Release workflow: on a `vX.Y.Z` tag, tests, publishes to PyPI through trusted publishing,
+  and pushes a multi-arch image (amd64, arm64, arm/v7) to GHCR. CI also builds the image.
+- README: a ten-minute Raspberry Pi quick start, Docker image from GHCR, troubleshooting
+  table, SSH key lock-down summary. `SECURITY.md`, `CONTRIBUTING.md`, issue templates.
+- Coverage report in CI (`pytest --cov`); `pytest-cov` in the `dev` extra.
+
+### Changed
+
+- Docker image: multi-stage build (so 32-bit ARM builds can compile what has no wheel),
+  `tzdata` included so `TZ=` sets the heartbeat's local time, runs from `/data` as uid 10001.
+- systemd unit: runs `--check-config` before starting, waits for time sync, more sandboxing.
+- Tokens and passwords are left out of the config object's printed form.
+
+## 0.x work after 0.1.0 (never tagged, included in 1.0.0)
 
 ### Fixed
 

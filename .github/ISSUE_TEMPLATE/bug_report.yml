@@ -1,0 +1,46 @@
+name: Bug report
+description: Something did not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Replace every token, URL, IP address, entity name or password with a placeholder
+        before posting. Security problems: use private reporting instead (see SECURITY.md).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to reproduce
+      description: The smallest config (secrets removed) and the steps or outage that trigger it.
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log lines
+      description: From `journalctl -u ha-watcher` or `docker logs`, run with `-v` if you can. Secrets removed.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: ha-watcher version
+      description: Output of `ha-watcher --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options: [pip / venv with systemd, Docker image, Docker built locally, other]
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Watcher box and OS, Home Assistant install type and version
+      placeholder: Raspberry Pi 4, Raspberry Pi OS Bookworm 64-bit; Home Assistant OS 2026.10

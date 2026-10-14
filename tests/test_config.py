@@ -179,3 +179,36 @@ def test_secrets_are_not_in_the_config_repr():
     cfg = _parse(lambda r: r.update(power_cycle={"enabled": True, "host": "h", "password": "plugpw"}))
     text = repr(cfg)
     assert "plugpw" not in text and "token='x'" not in text
+
+
+def test_example_config_lists_every_option():
+    # Keeps config.example.yaml a complete reference for the loader.
+    import yaml
+
+    from ha_watcher import config as c
+
+    ex = yaml.safe_load((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+    text = (ROOT / "config.example.yaml").read_text(encoding="utf-8")
+    sections = {
+        "home_assistant": c.HomeAssistantConfig,
+        "alerts": c.AlertConfig,
+        "heartbeat": c.HeartbeatConfig,
+        "deadman": c.DeadmanConfig,
+        "power_cycle": c.PowerCycleConfig,
+        "recovery_command": c.RecoveryCommandConfig,
+        "expiry": c.ExpiryConfig,
+        "phone_call": c.PhoneCallConfig,
+    }
+    missing = [
+        f"{name}.{key}"
+        for name, cls in sections.items()
+        for key in cls.__dataclass_fields__
+        if key not in ("twilio", "missing_env") and key not in ex[name] and f"# {key}:" not in text
+    ]
+    for check, defaults in c.CHECK_DEFAULTS.items():
+        missing += [
+            f"checks.{check}.{key}"
+            for key in set(defaults) - c.COMMON_KEYS
+            if key not in ex["checks"][check] and f"# {key}:" not in text
+        ]
+    assert missing == []
