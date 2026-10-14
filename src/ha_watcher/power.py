@@ -90,17 +90,28 @@ class KasaDriver:
             raise PowerError("Kasa device not found")
         try:
             await bounded(dev.update())
-            await bounded(dev.turn_off())
+            off_error: Exception | None = None
+            try:
+                await bounded(dev.turn_off())
+            except Exception as exc:  # noqa: BLE001 - the plug may have switched off anyway
+                off_error = exc
             await self.sleep(off_seconds)
             last: Exception | None = None
             for _ in range(3):  # Kasa cannot switch itself back on, so try hard
                 try:
                     await bounded(dev.turn_on())
-                    return
+                    break
                 except Exception as exc:  # noqa: BLE001
                     last = exc
                     await self.sleep(2)
-            raise PowerError(f"Kasa plug did not turn back on: {type(last).__name__}")
+            else:
+                raise PowerError(
+                    f"Kasa plug did not turn back on ({type(last).__name__}): the host may be OFF"
+                )
+            if off_error is not None:
+                raise PowerError(
+                    f"Kasa turn-off did not confirm ({type(off_error).__name__}); turn-on was sent"
+                )
         finally:
             with contextlib.suppress(Exception):  # the cycle itself is what matters
                 await bounded(dev.disconnect())
@@ -151,14 +162,26 @@ def decide(
     return Decision(True, f"down for {int(down.total_seconds() // 60)}m")
 
 
+_cycling = False
+
+
+def cycle_in_progress() -> bool:
+    """True while the plug is being switched; a stop request must wait for it."""
+    return _cycling
+
+
 def run_cycle(driver: Any, cfg: PowerCycleConfig) -> str:
+    global _cycling
     if cfg.dry_run:
         return "dry run: would have power-cycled the host"
     start = time.monotonic()
+    _cycling = True
     try:
         driver.power_cycle(cfg.off_seconds)
     except PowerError:
         raise
     except Exception as exc:  # noqa: BLE001 - any driver trouble is a failed attempt
         raise PowerError(f"power cycle failed: {type(exc).__name__}") from exc
+    finally:
+        _cycling = False
     return f"power-cycled the host (off {cfg.off_seconds}s, took {time.monotonic() - start:.0f}s)"

@@ -148,11 +148,11 @@ def test_rate_limit_suppresses_and_reports(tmp_path):
     )
     run(w, fake, 10)
     assert len(inbox.msgs) == 3  # minutes 0,1,2; then capped
-    assert w.state["suppressed"] == 7
+    assert w.state["suppressed"] == 1  # one held reminder, counted once however often retried
     fake.routes["/api/"] = (200, {"message": "API running."})
     w.run_once(NOW + 10 * M)  # recovery bypasses the cap and carries the count
     assert inbox.msgs[-1].severity == "recovery"
-    assert "7 earlier message(s) suppressed" in inbox.msgs[-1].body
+    assert "1 earlier message(s) suppressed" in inbox.msgs[-1].body
 
 
 def test_check_that_stops_reporting_a_key_sends_resolved(tmp_path):
@@ -556,3 +556,109 @@ def test_wall_clock_jump_restarts_the_outage_clock(tmp_path, monkeypatch):
     w.run_once()
     assert plug.cycles == 0
     assert w.state["checks"]["api"]["first_failure"] == clock["wall"].isoformat()
+
+
+# ------------------------------------------------------------- critic fixes
+def _cron_tick(tmp_path, fake, plug, t):
+    w, _, _ = watcher(tmp_path, fake, plug=plug, power_cycle=PC, alerts={"realert_minutes": 0})
+    w.oneshot = True  # what --once sets
+    w.run_once(t)
+    return w
+
+
+def test_cron_once_mode_at_5_and_10_minute_spacing_still_reaches_the_power_cycle(tmp_path):
+    # Each --once run is a fresh process; the start-up gap rule must not restart the
+    # outage clock every time, or nothing ever reaches after_minutes.
+    for spacing in (5, 10):
+        d = tmp_path / str(spacing)
+        d.mkdir()
+        fake, plug = FakeHA(API_DOWN), Plug()
+        for i in range(0, 40, spacing):
+            _cron_tick(d, fake, plug, NOW + i * M)
+        assert plug.cycles >= 1, spacing
+
+
+class Flaky(Notifier):
+    """Delivers, then fails to confirm (e.g. a read timeout after the server accepted it)."""
+
+    name = "flaky"
+
+    def __init__(self, deliver=True):
+        self.got, self.deliver = [], deliver
+
+    def send(self, msg):
+        if self.deliver:
+            self.got.append(msg)
+        raise httpx.ReadTimeout("slow")
+
+
+def test_unconfirmed_delivery_backs_off_instead_of_sending_every_loop(tmp_path):
+    fake = FakeHA(API_DOWN)
+    w, _, _ = watcher(tmp_path, fake, alerts={"realert_minutes": 0})
+    flaky = Flaky()
+    w.notifiers = [flaky]
+    run(w, fake, 60)
+    assert 1 <= len(flaky.got) <= 8  # was 58 without a backoff
+
+
+def test_dead_notifier_logs_one_error_per_outage(tmp_path, caplog):
+    import logging
+
+    fake = FakeHA(API_DOWN)
+    w, _, _ = watcher(tmp_path, fake, alerts={"realert_minutes": 0})
+    w.notifiers = [Flaky(deliver=False)]
+    with caplog.at_level(logging.DEBUG):
+        run(w, fake, 120)
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert 1 <= len(errors) <= 2  # the notifier failure and "no notifier delivered", once
+
+
+def test_one_held_alert_is_counted_once_as_suppressed(tmp_path):
+    fake = FakeHA()
+    w, inbox, _ = watcher(
+        tmp_path,
+        fake,
+        checks={"core": {"failures_before_alert": 1}},
+        alerts={"realert_minutes": 0, "max_per_hour": 1},
+    )
+    w.state["alert_times"] = [(NOW - 5 * M).isoformat()]
+    fake.routes["/api/config"] = (200, {"state": "RUNNING", "safe_mode": True})
+    for i in range(50):
+        w.run_once(NOW + i * M)
+    assert w.state["suppressed"] == 1
+    for i in range(50, 90):
+        w.run_once(NOW + i * M)
+    assert len(inbox.msgs) == 1 and "safe mode" in inbox.msgs[0].body
+    assert "1 earlier message(s) suppressed" in inbox.msgs[0].body
+
+
+def test_clock_correction_clamps_every_stored_future_time(tmp_path):
+    w, _, pings = watcher(tmp_path, deadman={"url": "https://hc-ping.example/abc"})
+    future = (NOW + timedelta(hours=6)).isoformat()
+    w.state["deadman_last"] = future
+    w.state["power"]["busy_seen"] = future
+    w.state["last_run"]["backup"] = future
+    w.state["heartbeat_last"] = (NOW + timedelta(days=1)).date().isoformat()
+    w.state["phone"]["last_attempt"] = future
+    w._restart_outage_clock(NOW, "test")
+    assert w.state["deadman_last"] == NOW.isoformat()
+    assert w.state["power"]["busy_seen"] == NOW.isoformat()
+    assert w.state["last_run"]["backup"] == NOW.isoformat()
+    assert w.state["phone"]["last_attempt"] == NOW.isoformat()
+    assert w.state["heartbeat_last"] is None
+    w.run_once(NOW + 2 * M)
+    assert pings.urls == ["https://hc-ping.example/abc"]
+
+
+def test_run_forever_stops_after_the_loop_when_asked(tmp_path):
+    w, _, _ = watcher(tmp_path)
+    loops = []
+
+    def fake_run_once(now=None):
+        loops.append(1)
+        w.stop_requested = True
+        return []
+
+    w.run_once = fake_run_once
+    w.run_forever(sleep=lambda s: None)
+    assert loops == [1]

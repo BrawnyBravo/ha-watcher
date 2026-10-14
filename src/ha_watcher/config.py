@@ -264,6 +264,25 @@ def _bool(value: Any, where: str) -> bool:
     raise ConfigError(f"{where}: must be true or false, got {value!r}")
 
 
+def _coerce(default: Any, value: Any, where: str) -> Any:
+    """Turn harmless text into the default's type: "false" -> False, "8123" -> 8123, 20.0 -> 20.
+
+    Anything else is left alone for the validators to report.
+    """
+    if isinstance(default, bool):
+        return _bool(value, where)
+    if isinstance(value, bool) or not isinstance(default, (int, float)):
+        return value
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return value
+    if isinstance(value, float) and isinstance(default, int) and value.is_integer():
+        return int(value)
+    return value
+
+
 def _str_list(value: Any, where: str) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
         raise ConfigError(f"{where}: must be a list of names, e.g. [a, b]")
@@ -277,8 +296,8 @@ def _build(cls: type, data: dict[str, Any], where: str) -> Any:
         raise ConfigError(f"{where}: unknown key(s) {', '.join(sorted(unknown))}")
     data = dict(data)
     for name, f in cls.__dataclass_fields__.items():
-        if name in data and isinstance(f.default, bool):
-            data[name] = _bool(data[name], f"{where}.{name}")
+        if name in data:
+            data[name] = _coerce(f.default, data[name], f"{where}.{name}")
     try:
         return cls(**data)
     except TypeError as exc:  # missing required field
@@ -324,6 +343,8 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     if not ha.url.startswith(("http://", "https://")):
         raise ConfigError("home_assistant.url must start with http:// or https://")
     _positive(ha.timeout_seconds, "home_assistant.timeout_seconds")
+    if isinstance(ha.ca_file, str) and not ha.ca_file.strip():
+        ha.ca_file = None  # ${HA_CA_FILE:-} left empty
     if ha.ca_file is not None and not Path(ha.ca_file).is_file():
         raise ConfigError(f"home_assistant.ca_file: {ha.ca_file} is not a readable file")
 
@@ -340,11 +361,13 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         extra = set(merged) - set(defaults) - COMMON_KEYS
         if extra:
             raise ConfigError(f"checks.{name}: unknown key(s) {', '.join(sorted(extra))}")
-        for key, default in defaults.items():
-            if isinstance(default, bool):
-                merged[key] = _bool(merged[key], f"checks.{name}.{key}")
-            elif isinstance(default, list):
+        for key, default in {**defaults, "failures_before_alert": 1, "every_seconds": 0}.items():
+            if key not in merged:
+                continue
+            if isinstance(default, list):
                 _str_list(merged[key], f"checks.{name}.{key}")
+            else:
+                merged[key] = _coerce(default, merged[key], f"checks.{name}.{key}")
         fba = merged["failures_before_alert"]
         if not isinstance(fba, int) or isinstance(fba, bool) or fba < 1:
             raise ConfigError(f"checks.{name}.failures_before_alert: must be an integer >= 1")
@@ -371,7 +394,7 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
         home_assistant=ha,
         checks=checks,
         notifiers=notifiers,
-        interval_seconds=raw.get("interval_seconds", 60),
+        interval_seconds=_coerce(60, raw.get("interval_seconds", 60), "interval_seconds"),
         state_file=raw.get("state_file", "ha-watcher-state.json"),
         name=raw.get("name", "Home Assistant"),
         alerts=_build(AlertConfig, _section(raw, "alerts"), "alerts"),

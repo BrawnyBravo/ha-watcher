@@ -178,3 +178,41 @@ def test_health_reports_a_stale_or_missing_loop(tmp_path, monkeypatch, capsys):
     state.write_text(json.dumps({"version": 1, "last_loop": old.isoformat()}), encoding="utf-8")
     assert cli.main(["--health", "-c", str(p)]) == 1
     assert "last loop" in capsys.readouterr().err
+
+
+def test_sigterm_during_a_power_cycle_waits_for_it(monkeypatch):
+    import signal
+
+    from ha_watcher import power
+
+    class W:
+        stop_requested = False
+
+    seen = {}
+    monkeypatch.setattr(signal, "signal", lambda sig, fn: seen.setdefault(sig, fn))
+    w = W()
+    cli._exit_on_sigterm(w)
+    monkeypatch.setattr(power, "_cycling", True)
+    seen[signal.SIGTERM](signal.SIGTERM, None)  # no SystemExit mid-cycle
+    assert w.stop_requested is True
+
+
+def test_main_installs_the_sigterm_handler(tmp_path, monkeypatch):
+    import signal
+
+    monkeypatch.setenv("HA_TOKEN", "x")
+    p = write_cfg(tmp_path, MINIMAL.replace("STATE", (tmp_path / "s.json").as_posix()))
+    seen = {}
+    monkeypatch.setattr(signal, "signal", lambda sig, fn: seen.setdefault(sig, fn))
+    monkeypatch.setattr(Watcher, "run_forever", lambda self: None)
+    assert cli.main(["-c", str(p)]) == 0
+    assert signal.SIGTERM in seen
+
+
+def test_once_mode_marks_the_watcher_as_oneshot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HA_TOKEN", "x")
+    p = write_cfg(tmp_path, MINIMAL.replace("STATE", (tmp_path / "s.json").as_posix()))
+    seen = []
+    monkeypatch.setattr(Watcher, "run_once", lambda self, now=None: seen.append(self.oneshot) or [])
+    cli.main(["--once", "-c", str(p)])
+    assert seen == [True]

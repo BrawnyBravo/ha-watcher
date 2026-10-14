@@ -104,6 +104,7 @@ def _sanitize(data: dict[str, Any]) -> dict[str, Any]:
         and _time_or_none(v.get("first_failure"))
         and _time_or_none(v.get("last_alert"))
         and _time_or_none(v.get("held_since"))
+        and _time_or_none(v.get("retry_at"))
     }
     base["last_run"] = {k: v for k, v in base["last_run"].items() if _aware(v)}
     for path in TIME_LISTS:

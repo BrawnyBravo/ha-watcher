@@ -8,10 +8,11 @@ import shutil
 import signal
 import sys
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import httpx
 
-from ha_watcher import __version__
+from ha_watcher import __version__, power
 from ha_watcher.config import TWILIO_ENV, Config, ConfigError, load_config
 from ha_watcher.engine import Watcher
 from ha_watcher.escalation import CallError, place_call
@@ -33,10 +34,20 @@ def build_watcher(cfg: Config) -> Watcher:
     return Watcher(cfg, HAClient(cfg.home_assistant), notifiers, http, driver=driver)
 
 
-def _exit_on_sigterm() -> None:
+def _exit_on_sigterm(watcher: Any = None) -> None:
     """Stop cleanly on SIGTERM (systemd, docker stop). As PID 1 in a container Python
-    would otherwise ignore it and be killed 10 seconds later."""
-    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+    would otherwise ignore it and be killed 10 seconds later. During a power cycle the
+    stop waits for the cycle to finish, so the host is never left switched off."""
+
+    def handler(signum: int, frame: Any) -> None:
+        if power.cycle_in_progress():
+            log.warning("stop requested; finishing the power cycle first")
+            if watcher is not None:
+                watcher.stop_requested = True
+            return
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handler)
 
 
 def _health(cfg: Config) -> int:
@@ -180,12 +191,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if sent == len(watcher.notifiers) else 1
 
     if args.once:
+        watcher.oneshot = True
         results = watcher.run_once()
         for r in results:
             print(f"{'OK  ' if r.ok else 'FAIL'} {r.key:<32} {r.message}")
         return 0 if all(r.ok for r in results) else 1
 
-    _exit_on_sigterm()
+    _exit_on_sigterm(watcher)
     try:
         watcher.run_forever()
     except KeyboardInterrupt:

@@ -134,8 +134,11 @@ def build_notifiers(
     return out
 
 
-def send_all(notifiers: list[Notifier], msg: Message) -> int:
-    """Send to every notifier; one failing never stops the others. Returns successes."""
+def send_all(notifiers: list[Notifier], msg: Message, quiet: bool = False) -> int:
+    """Send to every notifier; one failing never stops the others. Returns successes.
+
+    ``quiet`` logs failures at DEBUG: the caller already reported this failure streak.
+    """
     sent = 0
     for n in notifiers:
         try:
@@ -146,5 +149,5 @@ def send_all(notifiers: list[Notifier], msg: Message) -> int:
             detail = type(exc).__name__
             if isinstance(exc, httpx.HTTPStatusError):
                 detail = f"HTTP {exc.response.status_code}"
-            log.error("notifier %s failed: %s", n.name, detail)
+            log.log(logging.DEBUG if quiet else logging.ERROR, "notifier %s failed: %s", n.name, detail)
     return sent

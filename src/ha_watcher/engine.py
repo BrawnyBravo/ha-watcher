@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 
 
 STARTING_STATES = {"NOT_RUNNING", "STARTING"}
+RETRY_KEYS = ("retry_at", "retries", "held")
+MAX_RETRY_WAIT = timedelta(minutes=30)
 STARTUP_HOLD = timedelta(minutes=15)
 # Wall clock and monotonic clock may drift apart this much between loops before the
 # watcher decides the system clock was changed (e.g. NTP setting a clock-less Pi).
@@ -78,6 +80,9 @@ class Watcher:
         self.monotonic = time.monotonic
         self._last_tick: tuple[datetime, float] | None = None
         self._first_loop = True
+        self.oneshot = False  # --once: each run is its own process, often minutes apart (cron)
+        self.stop_requested = False  # set by the SIGTERM handler during a power cycle
+        self._delivery_failing = False  # log delivery failures loudly once per streak
 
     # ------------------------------------------------------------------ public
     def run_once(self, now: datetime | None = None) -> list[Result]:
@@ -112,13 +117,15 @@ class Watcher:
 
     def run_forever(self, sleep: Callable[[float], None] = time.sleep) -> None:
         log.info("watching %s every %ss", self.cfg.home_assistant.url, self.cfg.interval_seconds)
-        while True:
+        while not self.stop_requested:
             start = time.monotonic()
             try:
                 for r in self.run_once():
                     log.debug("%s ok=%s %s", r.key, r.ok, r.message)
             except Exception:  # noqa: BLE001 - the watcher must keep watching
                 log.exception("watch cycle failed")
+            if self.stop_requested:
+                break
             sleep(max(1.0, self.cfg.interval_seconds - (time.monotonic() - start)))
 
     # ------------------------------------------------------------------- clock
@@ -137,6 +144,10 @@ class Watcher:
         if not self._first_loop:
             return
         self._first_loop = False
+        if self.oneshot:
+            # --once from cron: a gap between runs is normal, so only the cron spacing
+            # limits how exactly outages are timed (see the README's cron note).
+            return
         last = parse(self.state["last_loop"])
         limit = max(timedelta(minutes=5), timedelta(seconds=3 * self.cfg.interval_seconds))
         if last and not (-CLOCK_SLACK < now - last < limit):
@@ -168,6 +179,21 @@ class Watcher:
             (phone, "calls"),
         ):
             holder[key] = [t if parse(t) <= now else stamp for t in holder[key]]
+        singles = [
+            (self.state, "deadman_last"),
+            (self.state["power"], "busy_seen"),
+            (phone, "last_attempt"),
+            (self.state["expiry"], "rdap_backoff_until"),
+            *((self.state["last_run"], k) for k in self.state["last_run"]),
+            *((item, "checked") for item in self.state["expiry"]["items"].values()),
+            *((st, "retry_at") for st in self.state["checks"].values()),
+        ]
+        for holder, key in singles:
+            if holder.get(key) and parse(holder[key]) > now:
+                holder[key] = stamp
+        local_today = now.astimezone(self.local_tz).date().isoformat()
+        if (self.state["heartbeat_last"] or "") > local_today:
+            self.state["heartbeat_last"] = None
         log.warning("%s; outage timers restart now so recovery actions wait their full delay", why)
 
     # ------------------------------------------------------------------ checks
@@ -252,12 +278,15 @@ class Watcher:
                     held = "; Core is RUNNING again" if st.get("held_since") else ""
                     recoveries.append(f"{r.message}{held}{took}")
                 st.update(ok=True, failures=0, alerting=False, first_failure=None, last_alert=None)
-                st.pop("held_since", None)
+                for key in ("held_since", *RETRY_KEYS):
+                    st.pop(key, None)
                 continue
             st.pop("held_since", None)
             st["ok"] = False
             st["failures"] += 1
             st["first_failure"] = st["first_failure"] or ts(now)
+            if st.get("retry_at") and now < parse(st["retry_at"]):
+                continue  # an undelivered alert waits for its retry time
             if not st["alerting"] and st["failures"] >= need:
                 st["alerting"] = True
                 st["last_alert"] = ts(now)
@@ -291,19 +320,30 @@ class Watcher:
         self.state["alert_times"] = times
         return len(times) < self.cfg.alerts.max_per_hour
 
-    def _send(self, msg: Message, now: datetime, bypass_limit: bool = False) -> bool:
-        """Send to every notifier. False if held back by the rate limit or nothing got through."""
+    def _send(
+        self, msg: Message, now: datetime, bypass_limit: bool = False, count_suppressed: bool = True
+    ) -> bool:
+        """Send to every notifier. False if held back by the rate limit or nothing got through.
+
+        ``count_suppressed`` is False for an alert already counted when it was first held back.
+        """
         if not bypass_limit and not self._rate_ok(now):
-            self.state["suppressed"] += 1
-            log.warning("rate limit reached; suppressed: %s", msg.title)
+            if count_suppressed:
+                self.state["suppressed"] += 1
+                log.warning("rate limit reached; suppressed: %s", msg.title)
             return False
         suppressed = self.state["suppressed"]
         if suppressed:
             msg.body += f"\n\n({suppressed} earlier message(s) suppressed by the rate limit)"
         log.info("notify [%s] %s: %s", msg.severity, msg.title, msg.body.replace("\n", " | "))
-        if self.notifiers and not send_all(self.notifiers, msg):
-            log.error("no notifier delivered: %s", msg.title)
+        if self.notifiers and not send_all(self.notifiers, msg, quiet=self._delivery_failing):
+            if not self._delivery_failing:
+                log.error("no notifier delivered: %s; retrying with a growing delay", msg.title)
+            self._delivery_failing = True
             return False
+        if self._delivery_failing and self.notifiers:
+            log.info("delivery works again")
+        self._delivery_failing = False
         self.state["suppressed"] = 0
         self.state["alert_times"].append(ts(now))
         return True
@@ -315,16 +355,29 @@ class Watcher:
         if alerts:
             title = f"{name}: problem" if len(alerts) == 1 else f"{name}: {len(alerts)} problems"
             body = "\n".join(f"- {text}" for _, text, _ in alerts)
-            if not self._send(Message(title, body, "alert"), now):
-                # Not delivered: undo, so it goes out on a later loop instead of being lost.
-                for key, _, previous in alerts:
-                    st = self.state["checks"].get(key)
+            states = [self.state["checks"].get(key) for key, _, _ in alerts]
+            fresh = any(st is not None and not st.get("held") for st in states)
+            if self._send(Message(title, body, "alert"), now, count_suppressed=fresh):
+                for st in states:
+                    for key in RETRY_KEYS:
+                        if st is not None:
+                            st.pop(key, None)
+            else:
+                # Not delivered: undo, so it goes out on a later loop instead of being lost,
+                # waiting 1, 2, 4 ... minutes (at most 30, or the re-alert interval) between
+                # tries so an unconfirmed delivery cannot repeat every loop.
+                realert = timedelta(minutes=self.cfg.alerts.realert_minutes)
+                cap = min(MAX_RETRY_WAIT, realert) if realert else MAX_RETRY_WAIT
+                for (_, _, previous), st in zip(alerts, states, strict=True):
                     if st is None:
                         continue
                     if previous is None:
                         st.update(alerting=False, last_alert=None)
                     else:
                         st["last_alert"] = previous
+                    tries = st.get("retries", 0)
+                    wait = min(timedelta(minutes=2**tries), cap)
+                    st.update(retries=tries + 1, retry_at=ts(now + wait), held=True)
         if recoveries:
             # Recoveries always go out: they close an alert someone is acting on.
             self._send(

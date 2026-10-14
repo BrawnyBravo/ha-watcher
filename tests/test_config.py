@@ -212,3 +212,23 @@ def test_example_config_lists_every_option():
             if key not in ex["checks"][check] and f"# {key}:" not in text
         ]
     assert missing == []
+
+
+def test_empty_ca_file_from_an_unset_variable_means_none():
+    cfg = _parse(lambda r: r["home_assistant"].update(ca_file="${HA_CA_FILE:-}"))
+    assert cfg.home_assistant.ca_file is None
+
+
+def test_numbers_from_env_vars_and_whole_floats_are_accepted():
+    def mutate(r):
+        r["checks"]["host"] = {"port": "${PORT}", "timeout_seconds": "2.5"}
+        r["alerts"] = {"max_per_hour": 20.0, "realert_minutes": "${RE:-30}"}
+        r["interval_seconds"] = "${INTERVAL:-45}"
+
+    cfg = _parse(mutate, {"PORT": "8124"})
+    assert cfg.checks["host"].options["port"] == 8124
+    assert cfg.checks["host"].options["timeout_seconds"] == 2.5
+    assert cfg.alerts.max_per_hour == 20 and isinstance(cfg.alerts.max_per_hour, int)
+    assert cfg.alerts.realert_minutes == 30 and cfg.interval_seconds == 45
+    with pytest.raises(ConfigError, match="checks.host.port"):
+        _parse(lambda r: r["checks"].update(host={"port": "http"}))
