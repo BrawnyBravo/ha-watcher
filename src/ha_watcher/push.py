@@ -33,7 +33,9 @@ MAX_BODY = 64 * 1024
 MAX_CHECKS = 32
 MAX_DETAIL = 1024
 MAX_TEXT = 128
-MAX_COUNT = 10**9
+MAX_COUNT = 10**9  # alerts_sent_24h
+MAX_FAILURES = 10**6
+MAX_INTERVAL = 86400
 NAME_LEN = 40
 _NOT_NAME = re.compile(r"[^a-z0-9_]")
 
@@ -61,8 +63,8 @@ def check_names(keys: list[str]) -> dict[str, str]:
     return out
 
 
-def _count(n: int) -> int:
-    return max(0, min(int(n), MAX_COUNT))
+def _count(n: int, high: int = MAX_COUNT) -> int:
+    return max(0, min(int(n), high))
 
 
 def _latest(stamps: list[str]) -> str | None:
@@ -80,7 +82,7 @@ def build_payload(w: Watcher, now: datetime) -> tuple[dict[str, Any], bytes]:
             "ok": bool(st["ok"]),
             "since": st.get("since") or (st["first_failure"] if not st["ok"] else None),
             "detail": st["message"],
-            "failures": _count(st["failures"]),
+            "failures": _count(st["failures"], MAX_FAILURES),
         }
     ran = {st["check"] for st in states.values()}
     for name, c in w.cfg.checks.items():
@@ -108,7 +110,7 @@ def build_payload(w: Watcher, now: datetime) -> tuple[dict[str, Any], bytes]:
         "watcher_id": cfg.watcher_id[:MAX_TEXT],
         "version": __version__[:MAX_TEXT],
         "sent_at": ts(now),
-        "interval_s": _count(cfg.every_seconds),
+        "interval_s": max(1, _count(cfg.every_seconds, MAX_INTERVAL)),
         "checks": checks,
         "outage": {
             "active": bool(alerting),

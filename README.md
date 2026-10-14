@@ -368,7 +368,7 @@ Off unless `url` is set. See "Home Assistant companion" below.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `url` | none | The webhook URL the HA Watcher integration shows when it is added. It is a secret: anyone who has it can post reports. Use `${HA_PUSH_URL}`. Empty = off. |
-| `every_seconds` | `60` | Seconds between reports. Keep it well under half the integration's offline timeout (default 5 minutes). |
+| `every_seconds` | `60` | Seconds between reports, 1 to 86400. Keep it well under half the integration's offline timeout (default 5 minutes). |
 | `timeout_seconds` | `10` | Per report, at most 30. |
 | `secret` | none | Optional shared secret. When set, each report carries `X-HA-Watcher-Timestamp` and `X-HA-Watcher-Signature: sha256=<HMAC-SHA256 of "timestamp.body">`; set the same secret in the integration. Use `${HA_PUSH_SECRET}`. |
 | `watcher_id` | host name | Stable id for this watcher install. |

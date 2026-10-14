@@ -35,8 +35,8 @@ def _ts(value, optional=False):
     assert datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is not None
 
 
-def _int(value, low):
-    assert isinstance(value, int) and not isinstance(value, bool) and low <= value <= 10**9
+def _int(value, low, high=10**9):
+    assert isinstance(value, int) and not isinstance(value, bool) and low <= value <= high
 
 
 def assert_contract(payload: dict, body: bytes | None = None) -> None:
@@ -61,7 +61,7 @@ def assert_contract(payload: dict, body: bytes | None = None) -> None:
     assert isinstance(payload["watcher_id"], str) and 1 <= len(payload["watcher_id"]) <= 128
     assert isinstance(payload["version"], str) and len(payload["version"]) <= 128
     _ts(payload["sent_at"])
-    _int(payload["interval_s"], 1)
+    _int(payload["interval_s"], 1, 86400)
     _int(payload["alerts_sent_24h"], 0)
     _ts(payload["last_power_cycle"], optional=True)
     _ts(payload["last_recovery_command"], optional=True)
@@ -72,7 +72,7 @@ def assert_contract(payload: dict, body: bytes | None = None) -> None:
         assert c["ok"] is None or isinstance(c["ok"], bool)
         _ts(c["since"], optional=True)
         assert isinstance(c["detail"], str) and len(c["detail"]) <= 1024
-        _int(c["failures"], 0)
+        _int(c["failures"], 0, 10**6)
     outage = payload["outage"]
     assert isinstance(outage["active"], bool)
     _ts(outage["since"], optional=True)
@@ -198,7 +198,7 @@ def test_body_stays_under_64_kib_with_huge_details(tmp_path):
     payload, body = build_payload(w, NOW)
     assert len(body) <= MAX_BODY
     assert_contract(payload, body)
-    assert all(c["failures"] == 10**9 for n, c in payload["checks"].items() if n.startswith("entity_"))
+    assert all(c["failures"] == 10**6 for n, c in payload["checks"].items() if n.startswith("entity_"))
 
 
 def test_push_failure_is_logged_once_never_with_the_url_and_alerts_still_go_out(tmp_path, caplog):
@@ -246,6 +246,7 @@ def test_no_push_without_a_url(tmp_path):
     [
         ({"url": "192.0.2.10:8123/api/webhook/x"}, "home_assistant_push.url"),
         ({"url": URL, "every_seconds": 0}, "home_assistant_push.every_seconds"),
+        ({"url": URL, "every_seconds": 86401}, "home_assistant_push.every_seconds"),
         ({"url": URL, "timeout_seconds": 0}, "home_assistant_push.timeout_seconds"),
         ({"url": URL, "watcher_id": 5}, "home_assistant_push.watcher_id"),
         ({"url": URL, "nope": 1}, "unknown key"),

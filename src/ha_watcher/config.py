@@ -487,7 +487,7 @@ def _validate_push(p: HomeAssistantPushConfig) -> None:
         raise ConfigError(
             "home_assistant_push.url must be the webhook URL shown by the integration (http:// or https://)"
         )
-    _whole(p.every_seconds, "home_assistant_push.every_seconds", 1)
+    _whole(p.every_seconds, "home_assistant_push.every_seconds", 1, 86400)
     _positive(p.timeout_seconds, "home_assistant_push.timeout_seconds")
     if p.timeout_seconds > 30:
         raise ConfigError("home_assistant_push.timeout_seconds: at most 30, so a push cannot stall the loop")

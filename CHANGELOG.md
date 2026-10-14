@@ -77,7 +77,8 @@ The first release meant for anyone to install and rely on. Everything from the u
 - `home_assistant_push`: an optional status report every `every_seconds` (default 60) to
   the HA Watcher companion integration, following its payload contract v1: check names
   mapped to `[a-z0-9_]{1,40}` (sorted, shortened with a hash when too long or taken), at
-  most 32 checks (the first 32 in sorted order), body under 64 KiB, counts capped at 10^9,
+  most 32 checks (the first 32 in sorted order), body under 64 KiB, counts kept within the
+  contract's limits (failures 10^6, alerts 10^9, interval 1 day),
   optional HMAC-SHA256 signing with `secret`. Off unless `url` is set; the URL and secret
   are never logged; a failed report is logged once per failure streak and never affects
   alerts.
