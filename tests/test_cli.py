@@ -161,3 +161,20 @@ def test_sigterm_ends_the_process_cleanly(monkeypatch):
         assert exc.code == 0
     else:
         raise AssertionError("SIGTERM handler did not exit")
+
+
+def test_health_reports_a_stale_or_missing_loop(tmp_path, monkeypatch, capsys):
+    import json
+    from datetime import datetime, timedelta
+
+    monkeypatch.setenv("HA_TOKEN", "x")
+    state = tmp_path / "state.json"
+    p = write_cfg(tmp_path, MINIMAL.replace("STATE", state.as_posix()))
+    assert cli.main(["--health", "-c", str(p)]) == 1  # no loop has run yet
+    now = datetime.now(UTC)
+    state.write_text(json.dumps({"version": 1, "last_loop": now.isoformat()}), encoding="utf-8")
+    assert cli.main(["--health", "-c", str(p)]) == 0
+    old = now - timedelta(minutes=10)
+    state.write_text(json.dumps({"version": 1, "last_loop": old.isoformat()}), encoding="utf-8")
+    assert cli.main(["--health", "-c", str(p)]) == 1
+    assert "last loop" in capsys.readouterr().err

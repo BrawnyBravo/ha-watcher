@@ -7,6 +7,7 @@ import logging
 import shutil
 import signal
 import sys
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -17,6 +18,7 @@ from ha_watcher.escalation import CallError, place_call
 from ha_watcher.ha import HAClient
 from ha_watcher.notifiers import Message, build_notifiers, send_all
 from ha_watcher.power import PowerError, build_driver
+from ha_watcher.state import load_state, parse
 
 log = logging.getLogger("ha_watcher")
 
@@ -35,6 +37,19 @@ def _exit_on_sigterm() -> None:
     """Stop cleanly on SIGTERM (systemd, docker stop). As PID 1 in a container Python
     would otherwise ignore it and be killed 10 seconds later."""
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+
+
+def _health(cfg: Config) -> int:
+    """For a container HEALTHCHECK: did the watcher save a finished loop recently?"""
+    last = parse(load_state(cfg.state_file).get("last_loop"))
+    limit = max(timedelta(minutes=5), timedelta(seconds=3 * cfg.interval_seconds))
+    age = datetime.now(UTC) - last if last else None
+    if age is None or age > limit:
+        when = f"{int(age.total_seconds())}s ago" if age else "never"
+        print(f"unhealthy: last loop finished {when} (limit {int(limit.total_seconds())}s)", file=sys.stderr)
+        return 1
+    print(f"healthy: last loop finished {int(age.total_seconds())}s ago")
+    return 0
 
 
 def summarize(cfg: Config) -> str:
@@ -97,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--once", action="store_true", help="run every check once, print, exit")
     mode.add_argument("--test-notify", action="store_true", help="send a test message to every notifier")
     mode.add_argument("--test-call", action="store_true", help="place one test phone call through Twilio")
+    mode.add_argument(
+        "--health", action="store_true", help="exit 0 if the running watcher finished a loop recently"
+    )
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args(argv)
@@ -112,6 +130,9 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
+
+    if args.health:
+        return _health(cfg)
 
     if args.check_config:
         try:

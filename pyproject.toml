@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ha-watcher"
-version = "0.1.0"
+dynamic = ["version"]
 description = "External watchdog for Home Assistant: runs on a separate box and alerts without depending on Home Assistant."
 readme = "README.md"
 license = "MIT"
@@ -13,7 +13,8 @@ requires-python = ">=3.11"
 authors = [{ name = "BrawnyBravo" }]
 keywords = ["home-assistant", "watchdog", "monitoring", "ntfy", "raspberry-pi"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: End Users/Desktop",
   "Environment :: Console",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
@@ -31,7 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 kasa = ["python-kasa>=0.7"]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.6"]
 
 [project.scripts]
 ha-watcher = "ha_watcher.cli:main"
@@ -39,6 +40,10 @@ ha-watcher = "ha_watcher.cli:main"
 [project.urls]
 Homepage = "https://github.com/BrawnyBravo/ha-watcher"
 Issues = "https://github.com/BrawnyBravo/ha-watcher/issues"
+Changelog = "https://github.com/BrawnyBravo/ha-watcher/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "src/ha_watcher/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ha_watcher"]
@@ -46,6 +51,14 @@ packages = ["src/ha_watcher"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.coverage.run]
+source = ["ha_watcher"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
 
 [tool.ruff]
 line-length = 110

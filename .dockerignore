@@ -1,8 +1,12 @@
 .venv
 .git
+.github
 .pytest_cache
 .ruff_cache
+.coverage
 dist
 build
+tests
 config.yaml
+state.json
 *.env
