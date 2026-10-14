@@ -155,6 +155,7 @@ services:
   ha-watcher:
     image: ghcr.io/brawnybravo/ha-watcher:1
     restart: unless-stopped
+    stop_grace_period: 90s       # lets a power cycle finish; see below
     environment:
       TZ: Europe/London          # local time for heartbeat.time
     env_file: ./ha-watcher.env   # HA_TOKEN=..., NTFY_TOPIC=...
@@ -171,6 +172,13 @@ not in the config. Check the config before starting:
 `docker run --rm --env-file ha-watcher.env -v $PWD/config.yaml:/config/config.yaml:ro ghcr.io/brawnybravo/ha-watcher:1 --check-config`.
 `docker ps` shows `healthy` once the watcher is finishing loops (see `--health`). Do not
 run the container on the Home Assistant host: it would go down with the thing it watches.
+
+**With `power_cycle` enabled, give the container time to finish a cycle when it is
+stopped.** A stop request during a power cycle waits for the plug to be switched back on,
+but Docker kills the container after 10 seconds by default, and a Kasa cycle takes
+`off_seconds` plus up to three turn-on tries. Use `--stop-timeout 90` with `docker run`, or
+`stop_grace_period: 90s` in Compose (this also covers updates by tools such as Watchtower).
+Shelly plugs switch themselves back on (`toggle_after`), so they are safe either way.
 
 ## Command line
 
@@ -386,10 +394,14 @@ exactly what may be down. A failed report is dropped and logged once until repor
 again; it never delays or changes an alert. Reports follow the integration's payload
 contract (version 1): check names are lowercased with anything outside `a-z0-9_` turned
 into `_` (`core:safe_mode` becomes `core_safe_mode`), names longer than 40 characters or
-already taken are shortened with a hash, and at most 32 checks are sent, the first 32 in
-sorted order of their keys, so the same ones every time (the integration creates at most
-32 entities per install). Many `entities` or add-ons can therefore push some checks past
-the 32nd; alerts still cover them.
+already taken are shortened with a hash. Names are worked out once over every check the
+config can report, in sorted order, so a check keeps its name whatever else is in a
+report. At most 32 checks are sent, the first 32 in sorted order of their keys, so the
+same ones every time (the integration creates at most 32 entities per install). Many
+`entities` or add-ons can therefore push some checks past the 32nd; alerts still cover
+them. The report's "outage" flag means Home Assistant itself is down (the `api` or `core`
+check is alerting), not that any check is failing, and `alerts_sent_24h` counts problem
+alerts that reached at least one notifier (not power-cycle or restart reports).
 
 ## Phone call escalation
 

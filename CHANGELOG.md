@@ -62,13 +62,21 @@ The first release meant for anyone to install and rely on. Everything from the u
 - A delivered alert whose notifier reply timed out was resent every loop (58 times in an
   hour in a test). Undelivered alerts now wait 1, 2, 4 ... minutes between tries (at most
   30, or `realert_minutes`), a failure streak is logged as an error once, and an alert held
-  back by the rate limit is counted once in the "suppressed" note.
+  back by the rate limit is counted once in the "suppressed" note. (Before release the
+  retry wait was cut to at most 5 minutes, held alerts go out as soon as any message is
+  delivered, and an alert held only by the rate limit goes out as soon as there is room.)
 - A clock correction now also resets the dead-man, busy, last-run, expiry and phone
   timestamps that were in the future, so the dead-man ping and checks with `every_seconds`
   do not stop until the clock catches up.
 - Kasa: a turn-off whose reply was lost left the host off; turn-on is now always attempted,
   and a failed turn-on says the host may be OFF.
 - A stop request (SIGTERM) during a power cycle now waits for the cycle to finish.
+- Every outbound call now has a wall-clock limit on the whole request (Home Assistant
+  REST and WebSocket, notifiers, dead-man ping, Shelly, Twilio, RDAP, certificate and TCP
+  host lookups, status push). Library timeouts only limit each read, so a server sending
+  one byte at a time could hold the watch loop indefinitely.
+- Number settings refuse `nan` and `inf` (an `alerts.realert_minutes: nan` stopped every
+  alert).
 - The container ignored `docker stop` (Python as PID 1 ignores SIGTERM) and was killed
   after the timeout. SIGTERM now ends it at once.
 
@@ -76,12 +84,15 @@ The first release meant for anyone to install and rely on. Everything from the u
 
 - `home_assistant_push`: an optional status report every `every_seconds` (default 60) to
   the HA Watcher companion integration, following its payload contract v1: check names
-  mapped to `[a-z0-9_]{1,40}` (sorted, shortened with a hash when too long or taken), at
+  mapped to `[a-z0-9_]{1,40}` once over every configured check key (sorted, shortened with a
+  hash when too long or taken, so names never depend on what one report contains), at
   most 32 checks (the first 32 in sorted order), body under 64 KiB, counts kept within the
   contract's limits (failures 10^6, alerts 10^9, interval 1 day),
   optional HMAC-SHA256 signing with `secret`. Off unless `url` is set; the URL and secret
   are never logged; a failed report is logged once per failure streak and never affects
-  alerts.
+  alerts. `outage` is true only while the `api` or `core` check is alerting;
+  `alerts_sent_24h` counts problem alerts that reached a notifier; `sent_at` and the
+  signature timestamp are taken when the report is sent and always increase.
 - `--health`: exits 0 when the running watcher saved a loop within max(5 minutes,
   3 x `interval_seconds`). The Docker image uses it as its `HEALTHCHECK`.
 - Release workflow: on a `vX.Y.Z` tag, tests, publishes to PyPI through trusted publishing,
