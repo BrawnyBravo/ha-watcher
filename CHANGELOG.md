@@ -13,16 +13,22 @@ The first release meant for anyone to install and rely on. Everything from the u
 
 - The state file carries over. Older files are read as before, and parts with a wrong type
   are reset one by one instead of discarding the file or crashing.
-- Config checks are stricter, so a config that 0.1.0 accepted may now be refused with a
-  message naming the key. Run `ha-watcher --check-config` before restarting the service:
+- **Run `ha-watcher -c <config> --check-config` before restarting the service.** Config
+  checks are stricter, so a config that 0.1.0 accepted may now be refused with a message
+  naming the key. The systemd unit now runs this check before every start: a refused
+  config keeps the service from starting (it retries every 30 seconds and logs the reason),
+  and nothing watches Home Assistant until it is fixed. What is now refused:
   - `power_cycle.after_minutes` must be greater than `recovery_command.after_minutes` when
     both are enabled.
   - Unknown keys in a notifier are errors.
   - On/off settings must be `true`/`false` (strings from `${VAR}` such as `"false"` or
     `"no"` are understood); other values are errors.
   - Lists (`entity_ids`, `addons`, `trigger_checks`, `only_if_passing`) must be lists, ports
-    and timeouts must be valid numbers, `ca_file` must exist and hold a certificate, and
-    `deadman.url` must start with `http://` or `https://`.
+    and timeouts must be valid numbers, a non-empty `ca_file` must exist and hold a
+    certificate, and `deadman.url` must start with `http://` or `https://`.
+  - Still accepted: numbers given as text (`port: "8123"`, for example from `${PORT}`),
+    whole numbers written as decimals (`max_per_hour: 20.0`), and an empty `ca_file`
+    (from `${HA_CA_FILE:-}`), which means none.
 
 ### Fixed
 
@@ -50,6 +56,19 @@ The first release meant for anyone to install and rely on. Everything from the u
   now limited to 20 seconds.
 - A bad `ca_file` crashed at start-up with a traceback; it is now a config error, also
   reported by `--check-config`.
+- `--once` from cron: each run would have looked like a restart after a long gap and
+  restarted the outage clock, so at a 5-minute or longer cron spacing the recovery command,
+  power cycle and phone call never fired. The gap rule is skipped in `--once` mode.
+- A delivered alert whose notifier reply timed out was resent every loop (58 times in an
+  hour in a test). Undelivered alerts now wait 1, 2, 4 ... minutes between tries (at most
+  30, or `realert_minutes`), a failure streak is logged as an error once, and an alert held
+  back by the rate limit is counted once in the "suppressed" note.
+- A clock correction now also resets the dead-man, busy, last-run, expiry and phone
+  timestamps that were in the future, so the dead-man ping and checks with `every_seconds`
+  do not stop until the clock catches up.
+- Kasa: a turn-off whose reply was lost left the host off; turn-on is now always attempted,
+  and a failed turn-on says the host may be OFF.
+- A stop request (SIGTERM) during a power cycle now waits for the cycle to finish.
 - The container ignored `docker stop` (Python as PID 1 ignores SIGTERM) and was killed
   after the timeout. SIGTERM now ends it at once.
 
@@ -67,7 +86,9 @@ The first release meant for anyone to install and rely on. Everything from the u
 
 - Docker image: multi-stage build (so 32-bit ARM builds can compile what has no wheel),
   `tzdata` included so `TZ=` sets the heartbeat's local time, runs from `/data` as uid 10001.
-- systemd unit: runs `--check-config` before starting, waits for time sync, more sandboxing.
+- systemd unit: runs `--check-config` before starting, is ordered after `time-sync.target`
+  (this only waits for a real sync if `systemd-time-wait-sync.service` is enabled; the
+  watcher's own clock-jump handling covers the rest), more sandboxing.
 - Tokens and passwords are left out of the config object's printed form.
 
 ## 0.x work after 0.1.0 (never tagged, included in 1.0.0)

@@ -6,9 +6,9 @@ Only the latest release gets fixes. Upgrade before reporting.
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for a security problem. Use GitHub's private reporting
-instead: the **Security** tab of this repository, **Report a vulnerability**. You should
-get an answer within a week. Once a fix is out, the report is credited in the changelog
+Please do not open a public issue for a security problem. Use GitHub's private
+vulnerability reporting instead: the **Security** tab of this repository, **Report a
+vulnerability**. You should get an answer within a week. Once a fix is out, the report is credited in the changelog
 unless you ask otherwise.
 
 Useful to include: the version (`ha-watcher --version`), how it is installed (pip, Docker,

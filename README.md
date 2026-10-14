@@ -133,7 +133,9 @@ To upgrade later, run the same `pip install` line with the new version tag, then
 
 Release images are published for `linux/amd64`, `linux/arm64` and `linux/arm/v7` (32-bit
 Raspberry Pi OS) as `ghcr.io/brawnybravo/ha-watcher:1` (or a full version such as `1.0.0`).
-To build your own instead: `docker build -t ha-watcher .` in a checkout.
+To build your own instead, in a checkout: `docker build -t ha-watcher .` with BuildKit, the
+default builder since Docker 23. On an older Docker (for example Debian's `docker.io` 20.10)
+use `DOCKER_BUILDKIT=1 docker build -t ha-watcher .` or `docker buildx build --load -t ha-watcher .`.
 
 ```sh
 docker run -d --name ha-watcher --restart unless-stopped \
@@ -190,13 +192,20 @@ from cron if you prefer that to a long-running service:
 (Per-check `every_seconds` still applies, because the last run time is kept in the state
 file; the debounce counts runs of that check.)
 
+Timing from cron is only as fine as the cron spacing: `failures_before_alert: 3` means three
+cron runs, and `after_minutes` for the recovery command, power cycle and phone call is
+reached at the first run after that much time. Keep the spacing well below those delays
+(every 1 to 2 minutes). In `--once` mode the watcher cannot tell a long gap between runs
+from a stopped service, so the "outage clock restarts after a gap" protection described
+under the power cycle applies to the long-running service only.
+
 ## Configuration reference
 
 See [`config.example.yaml`](config.example.yaml) for a complete, commented file. Any string
 may use `${VAR}` or `${VAR:-default}`; a missing variable without a default is a config
 error that names the variable. Unknown keys are errors, so typos are caught. A value that
 comes from a variable is always text: `true`/`false` (also `yes`/`no`, `on`/`off`, `1`/`0`)
-work for on/off settings, but numbers must be written in the file itself.
+work for on/off settings, and number settings accept text that is a number (`"8123"`).
 
 ### Top level
 

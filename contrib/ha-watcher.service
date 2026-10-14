@@ -6,6 +6,8 @@
 Description=ha-watcher - external Home Assistant watchdog
 Documentation=https://github.com/BrawnyBravo/ha-watcher
 Wants=network-online.target
+# time-sync.target only waits for a real sync if systemd-time-wait-sync.service is enabled;
+# the watcher restarts its outage timers when it sees the clock jump, either way.
 After=network-online.target time-sync.target
 
 [Service]
