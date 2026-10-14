@@ -488,6 +488,10 @@ def _validate_push(p: HomeAssistantPushConfig) -> None:
             raise ConfigError(f"home_assistant_push.{key}: must be text")
         if isinstance(value, str) and not value.strip():
             setattr(p, key, None)  # ${VAR:-} left empty: off / unsigned
+    if p.secret is not None and len(p.secret) < 16:
+        raise ConfigError(
+            "home_assistant_push.secret: must be at least 16 characters (the integration refuses shorter)"
+        )
     if p.url and not p.url.startswith(("http://", "https://")):
         raise ConfigError(
             "home_assistant_push.url must be the webhook URL shown by the integration (http:// or https://)"

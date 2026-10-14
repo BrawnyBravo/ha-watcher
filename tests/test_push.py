@@ -173,12 +173,12 @@ def test_payload_during_an_outage(tmp_path):
 
 
 def test_signed_when_a_secret_is_set(tmp_path):
-    w, sent = watcher(tmp_path, push={"secret": "s3cret"})
+    w, sent = watcher(tmp_path, push={"secret": "s3cret-0123456789"})
     w.run_once(NOW)
     req = sent[0]
     stamp = req.headers["X-HA-Watcher-Timestamp"]
     assert stamp.isdigit()
-    mac = hmac.new(b"s3cret", stamp.encode() + b"." + req.content, hashlib.sha256).hexdigest()
+    mac = hmac.new(b"s3cret-0123456789", stamp.encode() + b"." + req.content, hashlib.sha256).hexdigest()
     assert req.headers["X-HA-Watcher-Signature"] == f"sha256={mac}"
 
 
@@ -269,9 +269,9 @@ def test_config_errors(push, msg):
 
 
 def test_url_and_secret_are_not_in_the_config_repr():
-    cfg = make_cfg(home_assistant_push={"url": URL, "secret": "s3cret", "every_seconds": "30"})
+    cfg = make_cfg(home_assistant_push={"url": URL, "secret": "s3cret-0123456789", "every_seconds": "30"})
     assert cfg.home_assistant_push.enabled and cfg.home_assistant_push.every_seconds == 30
-    assert "ab" * 32 not in repr(cfg) and "s3cret" not in repr(cfg)
+    assert "ab" * 32 not in repr(cfg) and "s3cret-0123456789" not in repr(cfg)
 
 
 def test_empty_url_from_an_unset_variable_means_off():
@@ -377,7 +377,7 @@ def test_alerts_sent_counts_only_delivered_problem_alerts(tmp_path):
 
 
 def test_sent_at_and_signature_use_the_send_time_and_strictly_increase(tmp_path):
-    w, sent = watcher(tmp_path, push={"secret": "s3cret", "every_seconds": 1})
+    w, sent = watcher(tmp_path, push={"secret": "s3cret-0123456789", "every_seconds": 1})
     later = NOW + timedelta(minutes=7)
     w.push.clock = lambda: later.timestamp()  # the loop started 7 minutes earlier
     w.run_once(NOW)
@@ -481,3 +481,9 @@ def test_other_outbound_calls_are_bounded_too(tmp_path, drip):
     start = time.monotonic()
     w._deadman(NOW)
     assert time.monotonic() - start < 2.5 and w.state["deadman_last"] is None
+
+
+def test_a_short_signing_secret_is_refused():
+    with pytest.raises(ConfigError, match="at least 16"):
+        make_cfg(home_assistant_push={"url": URL, "secret": "short"})
+    assert make_cfg(home_assistant_push={"url": URL, "secret": "x" * 16}).home_assistant_push.secret

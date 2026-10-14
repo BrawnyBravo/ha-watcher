@@ -138,5 +138,5 @@ home_assistant_push:           # status reports to the HA Watcher integration; O
   url: ${HA_PUSH_URL:-}        # the webhook URL the integration shows; it is a secret
   every_seconds: 60            # 1 to 86400; keep well under half the integration's offline timeout
   timeout_seconds: 10          # per report, at most 30; a failed report is dropped
-  secret: ${HA_PUSH_SECRET:-}  # optional: signs each report (HMAC-SHA256) when set
+  secret: ${HA_PUSH_SECRET:-}  # optional, 16+ characters: signs each report (HMAC-SHA256)
   watcher_id: ""               # empty = this machine's host name

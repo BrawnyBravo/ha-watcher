@@ -378,7 +378,7 @@ Off unless `url` is set. See "Home Assistant companion" below.
 | `url` | none | The webhook URL the HA Watcher integration shows when it is added. It is a secret: anyone who has it can post reports. Use `${HA_PUSH_URL}`. Empty = off. |
 | `every_seconds` | `60` | Seconds between reports, 1 to 86400. Keep it well under half the integration's offline timeout (default 5 minutes). |
 | `timeout_seconds` | `10` | Per report, at most 30. |
-| `secret` | none | Optional shared secret. When set, each report carries `X-HA-Watcher-Timestamp` and `X-HA-Watcher-Signature: sha256=<HMAC-SHA256 of "timestamp.body">`; set the same secret in the integration. Use `${HA_PUSH_SECRET}`. |
+| `secret` | none | Optional shared secret, at least 16 characters. When set, each report carries `X-HA-Watcher-Timestamp` and `X-HA-Watcher-Signature: sha256=<HMAC-SHA256 of "timestamp.body">`; set the same secret in the integration. Use `${HA_PUSH_SECRET}`. |
 | `watcher_id` | host name | Stable id for this watcher install. |
 
 ## Home Assistant companion
@@ -399,7 +399,16 @@ config can report, in sorted order, so a check keeps its name whatever else is i
 report. At most 32 checks are sent, the first 32 in sorted order of their keys, so the
 same ones every time (the integration creates at most 32 entities per install). Many
 `entities` or add-ons can therefore push some checks past the 32nd; alerts still cover
-them. The report's "outage" flag means Home Assistant itself is down (the `api` or `core`
+them.
+
+- A signed report must carry a newer timestamp than the last one Home Assistant accepted.
+  A watcher restarted within the same second as its last signed report, or one whose clock
+  steps back, gets `401` until its time passes that report; it logs one warning and
+  recovers on its own.
+- Give a Kasa plug's `power_cycle.host` as an IP address, not a host name: a stalled name
+  lookup can hold up a power cycle.
+
+The report's "outage" flag means Home Assistant itself is down (the `api` or `core`
 check is alerting), not that any check is failing, and `alerts_sent_24h` counts problem
 alerts that reached at least one notifier (not power-cycle or restart reports).
 
