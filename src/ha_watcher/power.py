@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 
 from ha_watcher.config import PowerCycleConfig
+from ha_watcher.deadline import Bounded
 
 
 class PowerError(Exception):
@@ -34,6 +35,7 @@ class ShellyGen2Driver:
             auth = httpx.DigestAuth(cfg.username or "admin", cfg.password)
         host = cfg.host if cfg.host.startswith("http") else f"http://{cfg.host}"
         self.http = httpx.Client(base_url=host, auth=auth, timeout=10, transport=transport)
+        self.limit = Bounded("Shelly")
 
     def power_cycle(self, off_seconds: int) -> None:
         body = {
@@ -42,7 +44,7 @@ class ShellyGen2Driver:
             "params": {"id": self.cfg.switch_id, "on": False, "toggle_after": off_seconds},
         }
         try:
-            resp = self.http.post("/rpc", json=body)
+            resp = self.limit.call(25, self.http.post, "/rpc", json=body)
         except httpx.HTTPError as exc:
             raise PowerError(f"Shelly unreachable: {type(exc).__name__}") from exc
         if resp.status_code != 200:

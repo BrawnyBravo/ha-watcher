@@ -12,6 +12,8 @@ from typing import Any
 
 import httpx
 
+from ha_watcher.deadline import Bounded
+
 log = logging.getLogger(__name__)
 
 SEVERITIES = ("alert", "recovery", "info")
@@ -26,6 +28,7 @@ class Message:
 
 class Notifier:
     name = "notifier"
+    deadline = 45.0  # seconds for one whole send, however slowly the server answers
 
     def send(self, msg: Message) -> None:  # pragma: no cover - interface
         raise NotImplementedError
@@ -141,8 +144,9 @@ def send_all(notifiers: list[Notifier], msg: Message, quiet: bool = False) -> in
     """
     sent = 0
     for n in notifiers:
+        limit = n.__dict__.setdefault("_limit", Bounded(f"notifier {n.name}"))
         try:
-            n.send(msg)
+            limit.call(n.deadline, n.send, msg)
             sent += 1
         except Exception as exc:  # noqa: BLE001 - delivery must not crash the watcher
             # Never log str(exc): webhook URLs and SMTP errors can carry secrets.

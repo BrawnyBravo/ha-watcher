@@ -6,6 +6,7 @@ Secrets never live in the file: any string value may contain ``${VAR}`` or
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import socket
@@ -296,6 +297,8 @@ def _coerce(default: Any, value: Any, where: str) -> Any:
             value = float(value.strip())
         except ValueError:
             return value
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ConfigError(f"{where}: must be a finite number, got {value!r}")
     if isinstance(value, float) and isinstance(default, int) and value.is_integer():
         return int(value)
     return value
@@ -325,6 +328,8 @@ def _build(cls: type, data: dict[str, Any], where: str) -> Any:
 def _positive(value: Any, where: str, allow_zero: bool = False) -> None:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ConfigError(f"{where}: must be a number, got {value!r}")
+    if not math.isfinite(value):
+        raise ConfigError(f"{where}: must be a finite number, got {value!r}")
     if value < 0 or (value == 0 and not allow_zero):
         raise ConfigError(f"{where}: must be {'>= 0' if allow_zero else '> 0'}")
 

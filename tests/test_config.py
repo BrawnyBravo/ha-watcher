@@ -233,3 +233,11 @@ def test_numbers_from_env_vars_and_whole_floats_are_accepted():
     assert cfg.alerts.realert_minutes == 30 and cfg.interval_seconds == 45
     with pytest.raises(ConfigError, match="checks.host.port"):
         _parse(lambda r: r["checks"].update(host={"port": "http"}))
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf", float("nan"), float("inf")])
+def test_non_finite_numbers_are_rejected(bad):
+    with pytest.raises(ConfigError, match="realert_minutes"):
+        _parse(lambda r: r.update(alerts={"realert_minutes": bad}))
+    with pytest.raises(ConfigError, match="interval_seconds"):
+        _parse(lambda r: r.update(interval_seconds=bad))

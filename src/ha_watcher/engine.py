@@ -13,6 +13,7 @@ import httpx
 from ha_watcher import power, recovery
 from ha_watcher.checks import CHECKS, NEEDS_API, Context, Result, detect_busy, fmt_age
 from ha_watcher.config import Config
+from ha_watcher.deadline import Bounded
 from ha_watcher.escalation import PhoneEscalation
 from ha_watcher.expiry import ExpiryWatch
 from ha_watcher.ha import HAClient, HAError
@@ -25,7 +26,7 @@ log = logging.getLogger(__name__)
 
 STARTING_STATES = {"NOT_RUNNING", "STARTING"}
 RETRY_KEYS = ("retry_at", "retries", "held")
-MAX_RETRY_WAIT = timedelta(minutes=30)
+MAX_RETRY_WAIT = timedelta(minutes=5)
 STARTUP_HOLD = timedelta(minutes=15)
 # Wall clock and monotonic clock may drift apart this much between loops before the
 # watcher decides the system clock was changed (e.g. NTP setting a clock-less Pi).
@@ -85,6 +86,9 @@ class Watcher:
         self.stop_requested = False  # set by the SIGTERM handler during a power cycle
         self._delivery_failing = False  # log delivery failures loudly once per streak
         self.push = StatusPush(self, http)
+        self.deadman_deadline = 20.0
+        self._deadman_limit = Bounded("dead-man ping")
+        self._limited = False  # the last _send was held back by the rate limit
 
     # ------------------------------------------------------------------ public
     def run_once(self, now: datetime | None = None) -> list[Result]:
@@ -338,7 +342,9 @@ class Watcher:
 
         ``count_suppressed`` is False for an alert already counted when it was first held back.
         """
+        self._limited = False
         if not bypass_limit and not self._rate_ok(now):
+            self._limited = True
             if count_suppressed:
                 self.state["suppressed"] += 1
                 log.warning("rate limit reached; suppressed: %s", msg.title)
@@ -357,9 +363,10 @@ class Watcher:
         self._delivery_failing = False
         self.state["suppressed"] = 0
         self.state["alert_times"].append(ts(now))
-        if msg.severity == "alert":
-            self.state["alerts_24h"].append(ts(now))
-            self.state["alerts_24h"] = self.state["alerts_24h"][-1000:]
+        # Delivery works: alerts waiting out a retry delay go on the next loop.
+        for st in self.state["checks"].values():
+            st.pop("retry_at", None)
+            st.pop("retries", None)
         return True
 
     def _deliver(
@@ -376,10 +383,14 @@ class Watcher:
                     for key in RETRY_KEYS:
                         if st is not None:
                             st.pop(key, None)
+                if self.notifiers:  # problem alerts that reached someone, for the status push
+                    self.state["alerts_24h"] = [*self.state["alerts_24h"][-999:], ts(now)]
             else:
-                # Not delivered: undo, so it goes out on a later loop instead of being lost,
-                # waiting 1, 2, 4 ... minutes (at most 30, or the re-alert interval) between
-                # tries so an unconfirmed delivery cannot repeat every loop.
+                # Not delivered: undo, so it goes out on a later loop instead of being lost.
+                # Held by the rate limit: try every loop, it goes as soon as there is room.
+                # A failed delivery waits 1, 2, 4 ... minutes (at most 5, or the re-alert
+                # interval) so an unconfirmed delivery cannot repeat every loop.
+                limited = self._limited
                 realert = timedelta(minutes=self.cfg.alerts.realert_minutes)
                 cap = min(MAX_RETRY_WAIT, realert) if realert else MAX_RETRY_WAIT
                 for (_, _, previous), st in zip(alerts, states, strict=True):
@@ -389,9 +400,11 @@ class Watcher:
                         st.update(alerting=False, last_alert=None)
                     else:
                         st["last_alert"] = previous
-                    tries = st.get("retries", 0)
-                    wait = min(timedelta(minutes=2**tries), cap)
-                    st.update(retries=tries + 1, retry_at=ts(now + wait), held=True)
+                    st["held"] = True
+                    if not limited:
+                        tries = st.get("retries", 0)
+                        wait = min(timedelta(minutes=2**tries), cap)
+                        st.update(retries=tries + 1, retry_at=ts(now + wait))
         if recoveries:
             # Recoveries always go out: they close an alert someone is acting on.
             self._send(
@@ -561,7 +574,7 @@ class Watcher:
         if dm.signal_failures and any(v["alerting"] for v in self.state["checks"].values()):
             url += "/fail"
         try:
-            self.http.get(url, timeout=10).raise_for_status()
+            self._deadman_limit.call(self.deadman_deadline, self.http.get, url, timeout=10).raise_for_status()
             self.state["deadman_last"] = ts(now)
         except Exception as exc:  # noqa: BLE001 - log only the type: the URL is a secret
             log.warning("dead-man ping failed: %s", type(exc).__name__)

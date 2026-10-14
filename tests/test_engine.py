@@ -598,7 +598,7 @@ def test_unconfirmed_delivery_backs_off_instead_of_sending_every_loop(tmp_path):
     flaky = Flaky()
     w.notifiers = [flaky]
     run(w, fake, 60)
-    assert 1 <= len(flaky.got) <= 8  # was 58 without a backoff
+    assert 1 <= len(flaky.got) <= 15  # was 58 without a backoff; waits cap at 5 minutes
 
 
 def test_dead_notifier_logs_one_error_per_outage(tmp_path, caplog):
@@ -662,3 +662,59 @@ def test_run_forever_stops_after_the_loop_when_asked(tmp_path):
     w.run_once = fake_run_once
     w.run_forever(sleep=lambda s: None)
     assert loops == [1]
+
+
+# ------------------------------------------------------------ critic round 2
+class _Down(Notifier):
+    name = "down"
+
+    def __init__(self):
+        self.fail, self.got = True, []
+
+    def send(self, msg):
+        if self.fail:
+            raise httpx.ConnectError("offline")
+        self.got.append(msg)
+
+
+def test_rate_limit_hold_goes_out_as_soon_as_the_budget_frees(tmp_path):
+    fake = FakeHA()
+    w, inbox, _ = watcher(
+        tmp_path,
+        fake,
+        checks={"core": {"failures_before_alert": 1}},
+        alerts={"realert_minutes": 0, "max_per_hour": 1},
+    )
+    w.state["alert_times"] = [(NOW - 5 * M).isoformat()]  # the budget frees at minute 55
+    fake.routes["/api/config"] = (200, {"state": "RUNNING", "safe_mode": True})
+    for i in range(55):
+        w.run_once(NOW + i * M)
+    assert inbox.msgs == []
+    w.run_once(NOW + 55 * M + timedelta(seconds=1))
+    assert len(inbox.msgs) == 1
+
+
+def test_backoff_is_at_most_five_minutes(tmp_path):
+    fake = FakeHA(API_DOWN)
+    w, _, _ = watcher(tmp_path, fake, alerts={"realert_minutes": 0})
+    down = _Down()
+    w.notifiers = [down]
+    run(w, fake, 40)
+    down.fail = False
+    for i in range(40, 46):  # back at minute 40: delivered within 5 minutes
+        w.run_once(NOW + i * M)
+    assert len(down.got) == 1
+
+
+def test_any_successful_send_releases_held_alerts(tmp_path):
+    from ha_watcher.notifiers import Message
+
+    fake = FakeHA(API_DOWN)
+    w, _, _ = watcher(tmp_path, fake, alerts={"realert_minutes": 0})
+    down = _Down()
+    w.notifiers = [down]
+    run(w, fake, 20)
+    down.fail = False
+    assert w._send(Message("x", "heartbeat", "info"), NOW + 20 * M, bypass_limit=True)
+    w.run_once(NOW + 20 * M)
+    assert any("API unreachable" in m.body for m in down.got)

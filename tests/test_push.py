@@ -125,7 +125,18 @@ def watcher(tmp_path, fake=None, push=None, **over):
         local_tz=UTC,
         state_path=str(tmp_path / "state.json"),
     )
+    w.push.clock = _ticking_clock()
     return w, sent
+
+
+def _ticking_clock(start=None, step=60.0):
+    t = [(NOW.timestamp() if start is None else start) - step]
+
+    def clock():
+        t[0] += step
+        return t[0]
+
+    return clock
 
 
 def test_pushes_a_valid_payload_every_interval(tmp_path):
@@ -304,3 +315,169 @@ def test_payload_passes_the_companion_validator(tmp_path):
     payload = json.loads(sent[-1].content)
     out = validate(payload)
     assert set(out["checks"]) == set(payload["checks"])
+
+
+# ----------------------------------------------------------- critic round 2
+def test_names_are_computed_over_the_full_configured_set():
+    from ha_watcher.push import configured_keys
+
+    cfg = make_cfg(
+        checks={
+            "entities": {"enabled": True, "entity_ids": ["sensor.b", "sensor.a"]},
+            "supervisor": {"enabled": True, "addons": ["core_mosquitto"]},
+        }
+    )
+    keys = configured_keys(cfg)
+    assert {"api", "core", "core:safe_mode", "entity:sensor.a", "entity:sensor.b"} <= set(keys)
+    assert {"supervisor", "supervisor:health", "supervisor:addon:core_mosquitto", "entities"} <= set(keys)
+    assert "backup" not in keys  # disabled in these tests
+
+
+def test_a_name_does_not_change_when_a_colliding_key_is_absent_from_the_report(tmp_path):
+    # entity:sensor.a.b and entity:sensor.a_b both map to entity_sensor_a_b.
+    ids = ["sensor.a_b", "sensor.a.b"]
+    states = {"/api/states/sensor.a_b": (200, {"state": "on"})}
+    w, sent = watcher(tmp_path, FakeHA(states), checks={"entities": {"enabled": True, "entity_ids": ids}})
+    w.run_once(NOW)
+    first = {c["detail"]: n for n, c in json.loads(sent[0].content)["checks"].items()}
+    w.state["checks"].pop("entity:sensor.a.b")  # the colliding key is not in this report
+    w.push.last = None
+    w.push.run(NOW + M)
+    second = {c["detail"]: n for n, c in json.loads(sent[1].content)["checks"].items()}
+    [detail] = [d for d in first if "sensor.a_b is on" in d]
+    assert second[detail] == first[detail]
+    assert first[detail] != "entity_sensor_a_b"  # sensor.a.b sorts first and keeps the plain name
+
+
+def test_outage_is_only_home_assistant_itself_being_down(tmp_path):
+    old = {"state": "unavailable", "last_changed": "2000-01-01T00:00:00+00:00"}
+    w, sent = watcher(
+        tmp_path,
+        FakeHA({"/api/states/sensor.x": (200, old)}),
+        checks={"entities": {"enabled": True, "entity_ids": ["sensor.x"]}},
+    )
+    w.run_once(NOW)
+    payload = json.loads(sent[0].content)
+    assert payload["checks"]["entity_sensor_x"]["ok"] is False
+    assert payload["outage"] == {"active": False, "since": None}
+
+
+def test_alerts_sent_counts_only_delivered_problem_alerts(tmp_path):
+    from ha_watcher.notifiers import Message
+
+    fake = FakeHA(API_DOWN)
+    w, sent = watcher(tmp_path, fake)
+    w.notifiers = []  # nothing receives anything
+    for i in range(4):
+        w.run_once(NOW + i * M)
+    assert json.loads(sent[-1].content)["alerts_sent_24h"] == 0
+    w.notifiers = [Inbox()]
+    w._send(Message("x: power cycle", "cycled", "alert"), NOW + 5 * M, bypass_limit=True)
+    assert w.state["alerts_24h"] == []
+
+
+def test_sent_at_and_signature_use_the_send_time_and_strictly_increase(tmp_path):
+    w, sent = watcher(tmp_path, push={"secret": "s3cret", "every_seconds": 1})
+    later = NOW + timedelta(minutes=7)
+    w.push.clock = lambda: later.timestamp()  # the loop started 7 minutes earlier
+    w.run_once(NOW)
+    assert json.loads(sent[0].content)["sent_at"] == later.isoformat()
+    assert sent[0].headers["X-HA-Watcher-Timestamp"] == str(int(later.timestamp()))
+    w.run_once(NOW + M)  # same wall-clock second: no second report
+    assert len(sent) == 1
+
+
+def _drip_server():
+    """A local HTTP server that sends headers, then one body byte every 0.2 s for 10 s."""
+    import socket
+    import threading
+
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    srv.settimeout(0.2)
+    stop = threading.Event()
+
+    def drip(conn):
+        try:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n")
+            for _ in range(50):
+                if stop.is_set():
+                    break
+                conn.sendall(b"x")
+                stop.wait(0.2)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def serve():
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                continue
+            threading.Thread(target=drip, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{srv.getsockname()[1]}", stop, srv
+
+
+@pytest.fixture
+def drip():
+    url, stop, srv = _drip_server()
+    yield url
+    stop.set()
+    srv.close()
+
+
+def test_a_dripping_push_endpoint_cannot_hold_the_loop(tmp_path, drip):
+    import time
+
+    cfg = make_cfg(home_assistant_push={"url": drip + "/api/webhook/x", "timeout_seconds": 1})
+    w = Watcher(
+        cfg,
+        make_client(FakeHA(), cfg=cfg),
+        [],
+        httpx.Client(timeout=1),
+        local_tz=UTC,
+        state_path=str(tmp_path / "s.json"),
+    )
+    start = time.monotonic()
+    w.push.run(NOW)
+    assert time.monotonic() - start < 2.5
+    assert w.push.failing
+
+
+def test_other_outbound_calls_are_bounded_too(tmp_path, drip):
+    import time
+
+    from ha_watcher.config import HomeAssistantConfig
+    from ha_watcher.ha import HAClient, HAError
+    from ha_watcher.notifiers import Message, WebhookNotifier, send_all
+
+    start = time.monotonic()
+    with pytest.raises(HAError):
+        HAClient(HomeAssistantConfig(url=drip, token="t", timeout_seconds=0.5)).get("/api/")
+    assert time.monotonic() - start < 2.5
+
+    hook = WebhookNotifier({"url": drip + "/hook"}, httpx.Client(timeout=0.5))
+    hook.deadline = 1.0
+    start = time.monotonic()
+    assert send_all([hook], Message("t", "b")) == 0
+    assert time.monotonic() - start < 2.5
+
+    cfg = make_cfg(deadman={"url": drip + "/ping"})
+    w = Watcher(
+        cfg,
+        make_client(FakeHA(), cfg=cfg),
+        [],
+        httpx.Client(timeout=0.5),
+        local_tz=UTC,
+        state_path=str(tmp_path / "s2.json"),
+    )
+    w.deadman_deadline = 1.0
+    start = time.monotonic()
+    w._deadman(NOW)
+    assert time.monotonic() - start < 2.5 and w.state["deadman_last"] is None

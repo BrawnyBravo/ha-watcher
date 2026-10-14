@@ -13,6 +13,7 @@ import httpx
 from websockets.sync.client import connect as ws_connect
 
 from ha_watcher.config import HomeAssistantConfig
+from ha_watcher.deadline import Bounded
 
 
 class HAError(Exception):
@@ -49,6 +50,8 @@ class HAClient:
             transport=transport,
         )
         self._ws_factory = ws_factory or ws_connect
+        self._rest_limit = Bounded("Home Assistant REST")
+        self._ws_limit = Bounded("Home Assistant WebSocket")
 
     def close(self) -> None:
         self._http.close()
@@ -57,7 +60,8 @@ class HAClient:
     def get(self, path: str) -> TimedResponse:
         start = time.perf_counter()
         try:
-            resp = self._http.get(path)
+            # The whole request, not just each read, ends at the deadline.
+            resp = self._rest_limit.call(self.cfg.timeout_seconds * 2 + 1, self._http.get, path)
         except httpx.TimeoutException as exc:
             raise HAError(f"GET {path}: timed out after {self.cfg.timeout_seconds:g}s") from exc
         except httpx.HTTPError as exc:
@@ -109,7 +113,8 @@ class HAClient:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
             kwargs["ssl"] = ctx
-        try:
+
+        def session() -> dict[str, Any]:
             with self._ws_factory(self.ws_url, **kwargs) as ws:
                 hello = self._recv(ws)
                 if hello.get("type") != "auth_required":
@@ -124,7 +129,10 @@ class HAClient:
                 while True:
                     msg = self._recv(ws)
                     if msg.get("id") == 1 and msg.get("type") == "result":
-                        break
+                        return msg
+
+        try:
+            msg = self._ws_limit.call(self.cfg.timeout_seconds * 3 + 1, session)
         except HAError:
             raise
         except Exception as exc:  # network, timeout, protocol errors
