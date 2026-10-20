@@ -487,3 +487,21 @@ def test_a_short_signing_secret_is_refused():
     with pytest.raises(ConfigError, match="at least 16"):
         make_cfg(home_assistant_push={"url": URL, "secret": "short"})
     assert make_cfg(home_assistant_push={"url": URL, "secret": "x" * 16}).home_assistant_push.secret
+
+
+def test_signing_secret_is_trimmed_like_the_integration_does():
+    """The integration trims the secret it saves, so the watcher must sign with the trimmed one."""
+    cfg = make_cfg(home_assistant_push={"url": URL, "secret": "  s3cret-0123456789\n"})
+    assert cfg.home_assistant_push.secret == "s3cret-0123456789"
+    # The length rule applies after trimming, as in the integration.
+    with pytest.raises(ConfigError, match="at least 16"):
+        make_cfg(home_assistant_push={"url": URL, "secret": "  " + "x" * 15 + "  "})
+
+
+def test_a_trimmed_secret_signs_reports(tmp_path):
+    w, sent = watcher(tmp_path, push={"secret": " s3cret-0123456789 "})
+    w.run_once(NOW)
+    req = sent[0]
+    stamp = req.headers["X-HA-Watcher-Timestamp"]
+    mac = hmac.new(b"s3cret-0123456789", stamp.encode() + b"." + req.content, hashlib.sha256).hexdigest()
+    assert req.headers["X-HA-Watcher-Signature"] == f"sha256={mac}"
