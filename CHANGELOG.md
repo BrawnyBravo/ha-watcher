@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- `home_assistant_push.secret`: spaces and line breaks at either end are now removed
+  before use, the same way the HA Watcher integration trims the secret it saves. Before,
+  a secret pasted with a stray space signed every report with a different key and Home
+  Assistant refused them all (401). The 16-character minimum now applies after trimming.
+- README: the integration now fills in a shared secret when it is added and refuses
+  unsigned reports, so the setup steps say to copy both the webhook URL and the secret.
+
 ## [1.0.0] - 2026-10-19
 
 The first release meant for anyone to install and rely on. Everything from the unreleased
