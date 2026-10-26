@@ -12,6 +12,8 @@ All notable changes to this project are documented here. The format follows
   before use, the same way the HA Watcher integration trims the secret it saves. Before,
   a secret pasted with a stray space signed every report with a different key and Home
   Assistant refused them all (401). The 16-character minimum now applies after trimming.
+- README: the integration now fills in a shared secret when it is added and refuses
+  unsigned reports, so the setup steps say to copy both the webhook URL and the secret.
 
 ## [1.0.0] - 2026-10-19
 
