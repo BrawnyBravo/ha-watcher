@@ -5,3 +5,16 @@ updates:
     directory: /
     schedule:
       interval: monthly
+
+  # Python dependencies. Minor and patch updates arrive as one pull request a week; major
+  # updates arrive on their own. Every pull request is reviewed by hand (no auto-merge here:
+  # this service can cut power to a device).
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      python-minor-and-patch:
+        update-types:
+          - minor
+          - patch
