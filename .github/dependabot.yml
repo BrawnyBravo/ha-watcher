@@ -13,6 +13,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Dependencies are minimum versions only; raise them only when a new release needs it.
+    versioning-strategy: increase-if-necessary
     groups:
       python-minor-and-patch:
         update-types:
