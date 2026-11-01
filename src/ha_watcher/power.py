@@ -59,6 +59,29 @@ class ShellyGen2Driver:
             err = data["error"]
             raise PowerError(f"Shelly error: {err.get('message', err) if isinstance(err, dict) else err}")
 
+    def status(self) -> dict[str, Any]:
+        """Query only: is the switch answering, and is it on? Never switches anything."""
+        body = {"id": 1, "method": "Switch.GetStatus", "params": {"id": self.cfg.switch_id}}
+        try:
+            resp = self.limit.call(25, self.http.post, "/rpc", json=body)
+        except httpx.HTTPError as exc:
+            raise PowerError(f"Shelly unreachable: {type(exc).__name__}") from exc
+        if resp.status_code != 200:
+            raise PowerError(f"Shelly returned HTTP {resp.status_code}")
+        try:
+            data = resp.json()
+        except ValueError:
+            raise PowerError("Shelly reply not understood (is this a Gen2 or newer device?)") from None
+        if not isinstance(data, dict):
+            raise PowerError("Shelly reply not understood")
+        if "error" in data:
+            err = data["error"]
+            raise PowerError(f"Shelly error: {err.get('message', err) if isinstance(err, dict) else err}")
+        result = data.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("output"), bool):
+            raise PowerError("Shelly reply not understood (no switch state in the answer)")
+        return {"driver": "shelly", "on": result["output"]}
+
 
 class KasaDriver:
     """TP-Link Kasa/Tapo via python-kasa (``pip install ha-watcher[kasa]``)."""
@@ -125,6 +148,61 @@ class KasaDriver:
             raise
         except Exception as exc:  # noqa: BLE001
             raise PowerError(f"Kasa failed: {type(exc).__name__}") from exc
+
+    async def _status(self) -> dict[str, Any]:
+        def bounded(aw: Any) -> Any:
+            return asyncio.wait_for(aw, self.step_timeout)
+
+        dev = await bounded(
+            self.discover(self.cfg.host, username=self.cfg.username, password=self.cfg.password)
+        )
+        if dev is None:
+            raise PowerError("Kasa device not found")
+        try:
+            await bounded(dev.update())
+            info: dict[str, Any] = {"driver": "kasa", "on": bool(dev.is_on)}
+            hw = getattr(dev, "hw_info", None)
+            conn = getattr(getattr(dev, "config", None), "connection_type", None)
+            info["model"] = getattr(dev, "model", None)
+            info["firmware"] = hw.get("sw_ver") if isinstance(hw, dict) else None
+            enc = getattr(conn, "encryption_type", None)
+            info["encryption"] = getattr(enc, "value", enc)
+            login = getattr(conn, "login_version", None)
+            info["login_version"] = login
+            return info
+        finally:
+            with contextlib.suppress(Exception):
+                await bounded(dev.disconnect())
+
+    def status(self) -> dict[str, Any]:
+        """Query only: connect, read the on/off state and device details. Never switches anything."""
+        try:
+            return asyncio.run(asyncio.wait_for(self._status(), self.step_timeout * 3))
+        except PowerError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise PowerError(f"Kasa failed: {type(exc).__name__}") from exc
+
+
+def describe_status(st: dict[str, Any]) -> str:
+    """One plain line for a plug status from either driver."""
+    parts = [f"{st.get('driver', 'plug')} plug answers, currently {'on' if st.get('on') else 'off'}"]
+    for label, key in (("model", "model"), ("firmware", "firmware"), ("connection", "encryption")):
+        if st.get(key):
+            parts.append(f"{label} {st[key]}")
+    if st.get("login_version"):
+        parts.append(f"login v{st['login_version']}")
+    return ", ".join(parts)
+
+
+PLUG_HINT = (
+    "this plug may use a login method python-kasa cannot use yet "
+    "(newer TP-Link firmware); a Shelly plug is the supported choice"
+)
+
+
+def plug_hint(driver: str) -> str:
+    return f" ({PLUG_HINT})" if driver == "kasa" else ""
 
 
 def build_driver(cfg: PowerCycleConfig) -> Any:

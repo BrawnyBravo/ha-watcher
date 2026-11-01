@@ -26,6 +26,8 @@ def empty_state() -> dict[str, Any]:
         "heartbeat_last": None,
         "deadman_last": None,
         "last_loop": None,
+        "ha_down": False,  # the API or Core was failing at the last look
+        "ha_up_since": None,  # when Home Assistant last came back (startup grace for some checks)
         # dry_* lists: what a dry run would have done, so it keeps the same cooldown and cap
         # (one message per would-be action) without counting against the real ones.
         "power": {
@@ -68,6 +70,7 @@ TIME_LISTS = {
 TIMES = {
     ("deadman_last",),
     ("last_loop",),
+    ("ha_up_since",),
     ("power", "busy_seen"),
     ("phone", "called_outage"),
     ("phone", "last_attempt"),

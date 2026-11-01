@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `checks.plug` and `ha-watcher --check-plug`: a query-only pre-flight for the power-cycle
+  plug (state, and for Kasa the model, firmware and connection encryption). The check runs
+  once a day when enabled and alerts if the plug stops answering; neither switches anything.
+- `checks.stale`: one summary alert for listed or glob-matched entities that have not
+  reported for N hours (per-entity overrides, exclude globs, startup grace).
+- `checks.battery`: one summary alert for `battery` entities below a threshold, plus
+  batteries that stopped reporting.
+- `checks.stuck`: per-entity alert when an entity sits in an error state, or does not change,
+  for too long.
+- All four are off by default. The state file gains `ha_down` and `ha_up_since` (older
+  files load as before).
+
 ## [1.0.1] - 2026-11-01
 
 A small fix release. Most configs need no change. One exception: the push secret is now

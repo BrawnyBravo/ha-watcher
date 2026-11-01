@@ -189,6 +189,7 @@ class Watcher:
             holder[key] = [t if parse(t) <= now else stamp for t in holder[key]]
         singles = [
             (self.state, "deadman_last"),
+            (self.state, "ha_up_since"),
             (self.state["power"], "busy_seen"),
             (phone, "last_attempt"),
             (self.state["expiry"], "rdap_backoff_until"),
@@ -206,7 +207,8 @@ class Watcher:
 
     # ------------------------------------------------------------------ checks
     def _run_checks(self, now: datetime) -> tuple[list[Result], set[str]]:
-        ctx = Context(now=now, **self.ctx_hooks)
+        hooks = {"plug_status": getattr(self.driver, "status", None), **self.ctx_hooks}
+        ctx = Context(now=now, **hooks)
         results: list[Result] = []
         ran: set[str] = set()
         api_down = False
@@ -221,6 +223,7 @@ class Watcher:
                 if name == "api":
                     api_down = self._failing("api")
                 continue
+            ctx.ha_up_since = parse(self.state["ha_up_since"])
             try:
                 out = fn(self.client, ccfg.options, ctx)
             except Exception as exc:  # noqa: BLE001 - one broken check must not stop the rest
@@ -233,7 +236,26 @@ class Watcher:
             self.state["last_run"][name] = ts(now)
             if name == "api":
                 api_down = not all(r.ok for r in out)
+            self._track_ha_up(name, out, now)
         return results, ran
+
+    def _track_ha_up(self, name: str, out: list[Result], now: datetime) -> None:
+        """Remember when Home Assistant last came back, for the checks' startup grace.
+
+        The API check failing, or Core not RUNNING, marks it down; the next time the
+        last of those checks passes, "up since" is set to now. A watcher that starts
+        while Home Assistant is already up sets nothing (no grace is needed).
+        """
+        if name not in ("api", "core"):
+            return
+        st = self.state
+        if any(not r.ok for r in out if r.key == name):
+            st["ha_down"] = True
+            return
+        last = "core" if self.cfg.checks["core"].enabled else "api"
+        if name == last and st["ha_down"]:
+            st["ha_down"] = False
+            st["ha_up_since"] = ts(now)
 
     def _failing(self, key: str) -> bool:
         st = self.state["checks"].get(key)

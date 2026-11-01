@@ -8,6 +8,8 @@ so each gets its own debounce and its own recovery message.
 
 from __future__ import annotations
 
+import fnmatch
+import math
 import platform
 import socket
 import subprocess
@@ -18,6 +20,7 @@ from typing import Any
 
 from ha_watcher.deadline import Bounded, DeadlineExceeded
 from ha_watcher.ha import HAAuthError, HAClient, HAError
+from ha_watcher.power import PowerError, describe_status, plug_hint
 
 UNAVAILABLE = {"unavailable", "unknown"}
 BACKUP_BUSY_STATES = {"create_backup", "receive_backup", "restore_backup"}
@@ -37,6 +40,11 @@ class Context:
     # Set by the engine; the host check uses these hooks so tests can stub the network.
     tcp_connect: Callable[[str, int, float], None] | None = None
     ping: Callable[[str, float], bool] | None = None
+    # Query-only plug status (driver.status), set by the engine when a plug is configured.
+    plug_status: Callable[[], dict[str, Any]] | None = None
+    # When the engine last saw Home Assistant come back from being down (None = not seen
+    # down). The stale and battery checks stay quiet for a grace period after it.
+    ha_up_since: datetime | None = None
 
 
 def parse_ts(value: Any) -> datetime | None:
@@ -219,6 +227,164 @@ def check_memory(client: HAClient, opts: dict[str, Any], ctx: Context) -> list[R
     return [Result("memory", value <= limit, msg, {"value": value})]
 
 
+def check_plug(client: HAClient | None, opts: dict[str, Any], ctx: Context) -> list[Result]:
+    """Ask the power-cycle plug for its state. Query only: it never switches anything."""
+    if ctx.plug_status is None:
+        return [Result("plug", False, "No plug to check (power_cycle must be enabled)")]
+    try:
+        st = ctx.plug_status()
+    except Exception as exc:  # noqa: BLE001 - any driver trouble means the plug cannot be used
+        why = str(exc) if isinstance(exc, PowerError) else type(exc).__name__
+        hint = plug_hint(opts.get("driver", ""))
+        return [Result("plug", False, f"Power-cycle plug is not answering: {why}{hint}")]
+    return [Result("plug", True, describe_status(st), {k: v for k, v in st.items() if v is not None})]
+
+
+def _glob_match(entity_id: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(entity_id, p) for p in patterns)
+
+
+def _last_seen(st: dict[str, Any]) -> datetime | None:
+    return parse_ts(st.get("last_reported")) or parse_ts(st.get("last_updated"))
+
+
+def _in_grace(opts: dict[str, Any], ctx: Context) -> bool:
+    up = ctx.ha_up_since
+    return up is not None and (ctx.now - up).total_seconds() < opts["startup_grace_minutes"] * 60
+
+
+def _clip(items: list[str], limit: int) -> str:
+    shown = ", ".join(items[:limit])
+    return shown + (f" and {len(items) - limit} more" if len(items) > limit else "")
+
+
+def check_stale(client: HAClient, opts: dict[str, Any], ctx: Context) -> list[Result]:
+    """Entities that have not reported for too long (not the unavailable ones)."""
+    if _in_grace(opts, ctx):
+        return [Result("stale", True, "Home Assistant just started; stale check waits")]
+    try:
+        states = client.get_states()
+    except HAError as exc:
+        return [Result("stale", False, f"Cannot read entity states: {exc}")]
+    by_id = {s.get("entity_id"): s for s in states if isinstance(s, dict)}
+    wanted = set(opts["entity_ids"])
+    if opts["patterns"]:
+        wanted |= {e for e in by_id if isinstance(e, str) and _glob_match(e, opts["patterns"])}
+    wanted = {e for e in wanted if not _glob_match(e, opts["exclude"])}
+    stale: list[tuple[float, str]] = []
+    for eid in sorted(wanted):
+        st = by_id.get(eid)
+        if st is None:
+            stale.append((float("inf"), f"{eid} (not found)"))
+            continue
+        if st.get("state") in UNAVAILABLE:
+            continue  # the entities check's job
+        seen = _last_seen(st)
+        if seen is None:
+            continue
+        age = (ctx.now - seen).total_seconds()
+        if age > opts["overrides"].get(eid, opts["max_age_hours"]) * 3600:
+            stale.append((age, f"{eid} ({fmt_age(age)})"))
+    if not stale:
+        return [Result("stale", True, f"{len(wanted)} watched entities all reported recently")]
+    stale.sort(key=lambda t: -t[0])
+    names = [n for _, n in stale]
+    return [
+        Result(
+            "stale",
+            False,
+            f"{len(names)} entities have not reported: {_clip(names, opts['max_listed'])}",
+            {"count": len(names), "entities": names},
+        )
+    ]
+
+
+def _number(value: Any) -> float | None:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return n if math.isfinite(n) else None
+
+
+def check_battery(client: HAClient, opts: dict[str, Any], ctx: Context) -> list[Result]:
+    """Low batteries, and batteries that stopped reporting, in one summary."""
+    try:
+        states = client.get_states()
+    except HAError as exc:
+        return [Result("battery", False, f"Cannot read entity states: {exc}")]
+    grace = _in_grace(opts, ctx)
+    low: list[tuple[float, str]] = []
+    silent: list[tuple[float, str]] = []
+    total = 0
+    for st in states:
+        eid = st.get("entity_id", "")
+        if (st.get("attributes") or {}).get("device_class") != "battery":
+            continue
+        if _glob_match(eid, opts["exclude"]) or st.get("state") in UNAVAILABLE:
+            continue
+        level = _number(st.get("state"))
+        if level is None:
+            continue  # e.g. a binary_sensor reporting on/off
+        total += 1
+        if level < opts["overrides"].get(eid, opts["threshold_percent"]):
+            low.append((level, f"{eid} {level:g}%"))
+        seen = _last_seen(st)
+        hours = opts["stale_hours"]
+        if hours and not grace and seen is not None:
+            age = (ctx.now - seen).total_seconds()
+            if age > hours * 3600:
+                silent.append((age, f"{eid} ({fmt_age(age)})"))
+    if not low and not silent:
+        return [Result("battery", True, f"{total} batteries OK")]
+    low.sort()
+    silent.sort(key=lambda t: -t[0])
+    parts = []
+    if low:
+        parts.append(f"{len(low)} battery low: {_clip([n for _, n in low], opts['max_listed'])}")
+    if silent:
+        parts.append(
+            f"{len(silent)} battery not reporting: {_clip([n for _, n in silent], opts['max_listed'])}"
+        )
+    data = {"low": [n for _, n in low], "not_reporting": [n for _, n in silent]}
+    return [Result("battery", False, "; ".join(parts), data)]
+
+
+def check_stuck(client: HAClient, opts: dict[str, Any], ctx: Context) -> list[Result]:
+    """Entities sitting in an error state, or not changing at all, for too long."""
+    error_states = {e.lower() for e in opts["error_states"]}
+    err_limit = opts["max_error_minutes"] * 60
+    same_limit = opts["max_unchanged_hours"] * 3600
+    out: list[Result] = []
+    for entity_id in opts["entity_ids"]:
+        key = f"stuck:{entity_id}"
+        try:
+            st = client.get_state(entity_id)
+        except HAError as exc:
+            out.append(Result(key, False, f"Cannot read {entity_id}: {exc}"))
+            continue
+        if st is None:
+            out.append(Result(key, False, f"{entity_id} does not exist"))
+            continue
+        state = st.get("state")
+        if state in UNAVAILABLE:
+            out.append(Result(key, True, f"{entity_id} is {state} (the entities check covers this)"))
+            continue
+        since = parse_ts(st.get("last_changed"))
+        age = (ctx.now - since).total_seconds() if since else None
+        if str(state).lower() in error_states:
+            if age is None or age > err_limit:
+                shown = fmt_age(age) if age is not None else "an unknown time"
+                out.append(Result(key, False, f"{entity_id} has been in error state {state!r} for {shown}"))
+            else:
+                out.append(Result(key, True, f"{entity_id} is {state!r} for {fmt_age(age)} (within limit)"))
+        elif same_limit and age is not None and age > same_limit:
+            out.append(Result(key, False, f"{entity_id} has not changed from {state!r} for {fmt_age(age)}"))
+        else:
+            out.append(Result(key, True, f"{entity_id} is {state}"))
+    return out
+
+
 def _tcp_connect(host: str, port: int, timeout: float) -> None:
     with socket.create_connection((host, port), timeout=timeout):
         pass
@@ -263,9 +429,13 @@ CHECKS: dict[str, Callable[..., list[Result]]] = {
     "supervisor": check_supervisor,
     "entities": check_entities,
     "memory": check_memory,
+    "stale": check_stale,
+    "battery": check_battery,
+    "stuck": check_stuck,
+    "plug": check_plug,
 }
 # Checks that need HA's API; skipped (state kept) while the api check is failing.
-NEEDS_API = {"core", "backup", "supervisor", "entities", "memory"}
+NEEDS_API = {"core", "backup", "supervisor", "entities", "memory", "stale", "battery", "stuck"}
 
 
 def detect_busy(client: HAClient) -> list[str]:

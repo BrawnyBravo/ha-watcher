@@ -56,8 +56,43 @@ checks:
     port: 8123
     timeout_seconds: 3
 
+  stale:                       # entities that stopped reporting (all OFF by default)
+    enabled: false
+    every_seconds: 600
+    max_age_hours: 24          # last_reported older than this = stale
+    entity_ids:
+      - sensor.example_temperature
+    patterns: []               # globs, e.g. ["sensor.*_temperature"]
+    exclude: []                # globs removed from the two lists above
+    overrides: {}              # per entity, hours: {sensor.example_rain: 72}
+    startup_grace_minutes: 10  # stay quiet this long after Home Assistant comes back
+    max_listed: 10             # names shown in the alert
+
+  battery:                     # low batteries (device_class battery) and silent ones
+    enabled: false
+    every_seconds: 1800
+    threshold_percent: 20
+    overrides: {}              # per entity, percent: {sensor.example_door_battery: 10}
+    exclude: []                # globs
+    stale_hours: 48            # "battery not reporting" after this long; 0 = off
+    startup_grace_minutes: 10
+    max_listed: 10
+
+  stuck:                       # error state, or no change at all, for too long
+    enabled: false
+    every_seconds: 300
+    entity_ids:
+      - vacuum.example_robot
+    error_states: [error]      # case-insensitive
+    max_error_minutes: 10
+    max_unchanged_hours: 0     # >0: also fail if last_changed is older than this
+
+  plug:                        # needs power_cycle.enabled; asks the plug for its state
+    enabled: false             # query only, never switches. Test by hand: ha-watcher --check-plug
+    every_seconds: 86400       # once a day
+
 alerts:
-  realert_minutes: 60          # remind while still failing; 0 = once per outage
+  realert_minutes: 60         # remind while still failing; 0 = once per outage
   max_per_hour: 20             # rate limit; recoveries always go out
 
 notifiers:

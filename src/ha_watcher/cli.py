@@ -63,6 +63,24 @@ def _health(cfg: Config) -> int:
     return 0
 
 
+def _check_plug(cfg: Config, driver: Any = None) -> int:
+    """Query-only: connect to the power-cycle plug and report. Never switches it."""
+    pc = cfg.power_cycle
+    if not pc.enabled:
+        print("power_cycle is not enabled in the config, so there is no plug to check", file=sys.stderr)
+        return 2
+    try:
+        status = (driver or build_driver(pc)).status()
+    except PowerError as exc:
+        print(f"Plug check FAILED: {exc}{power.plug_hint(pc.driver)}", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001 - report any driver trouble as a failed check
+        print(f"Plug check FAILED: {type(exc).__name__}{power.plug_hint(pc.driver)}", file=sys.stderr)
+        return 1
+    print(f"Plug check OK: {power.describe_status(status)} (nothing was switched)")
+    return 0
+
+
 def summarize(cfg: Config) -> str:
     enabled = [n for n, c in cfg.checks.items() if c.enabled]
     lines = [
@@ -129,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--check-config", action="store_true", help="validate the config and exit")
     mode.add_argument("--once", action="store_true", help="run every check once, print, exit")
     mode.add_argument("--test-notify", action="store_true", help="send a test message to every notifier")
+    mode.add_argument(
+        "--check-plug",
+        action="store_true",
+        help="ask the power-cycle plug for its state and details (query only, switches nothing)",
+    )
     mode.add_argument("--test-call", action="store_true", help="place one test phone call through Twilio")
     mode.add_argument(
         "--health", action="store_true", help="exit 0 if the running watcher finished a loop recently"
@@ -151,6 +174,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.health:
         return _health(cfg)
+
+    if args.check_plug:
+        return _check_plug(cfg)
 
     if args.check_config:
         try:

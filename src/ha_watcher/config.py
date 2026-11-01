@@ -236,6 +236,43 @@ CHECK_DEFAULTS: dict[str, dict[str, Any]] = {
         "method": "tcp",
         "timeout_seconds": 3,
     },
+    # Entities that stopped reporting (last_reported older than max_age_hours).
+    "stale": {
+        "enabled": False,
+        "failures_before_alert": 2,
+        "every_seconds": 600,
+        "entity_ids": [],
+        "patterns": [],  # globs such as sensor.*_temperature
+        "exclude": [],  # globs removed from the above
+        "max_age_hours": 24,
+        "overrides": {},  # entity_id -> hours
+        "startup_grace_minutes": 10,  # quiet this long after Home Assistant comes back
+        "max_listed": 10,
+    },
+    # Batteries (device_class battery) that are low or have stopped reporting.
+    "battery": {
+        "enabled": False,
+        "failures_before_alert": 2,
+        "every_seconds": 1800,
+        "threshold_percent": 20,
+        "overrides": {},  # entity_id -> percent
+        "exclude": [],  # globs
+        "stale_hours": 48,  # 0 = do not flag silent batteries
+        "startup_grace_minutes": 10,
+        "max_listed": 10,
+    },
+    # Entities stuck in an error state, or not changing at all.
+    "stuck": {
+        "enabled": False,
+        "failures_before_alert": 1,
+        "every_seconds": 300,
+        "entity_ids": [],
+        "error_states": ["error"],
+        "max_error_minutes": 10,
+        "max_unchanged_hours": 0,  # 0 = off
+    },
+    # Query-only check that the power-cycle plug still answers. Needs power_cycle enabled.
+    "plug": {"enabled": False, "failures_before_alert": 1, "every_seconds": 86400},
 }
 COMMON_KEYS = {"enabled", "failures_before_alert", "every_seconds"}
 
@@ -441,6 +478,9 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     _validate_deadman(cfg.deadman)
     _validate_push(cfg.home_assistant_push)
     _validate_power(cfg.power_cycle, checks)
+    if checks["plug"].enabled and not cfg.power_cycle.enabled:
+        raise ConfigError("checks.plug needs power_cycle.enabled (it checks that plug)")
+    checks["plug"].options["driver"] = cfg.power_cycle.driver  # for the hint on failure
     _validate_recovery(cfg.recovery_command, checks)
     if (
         cfg.power_cycle.enabled
@@ -479,6 +519,46 @@ def _validate_checks(checks: dict[str, CheckConfig]) -> None:
     _whole(h.options["port"], "checks.host.port", 1, 65535)
     _positive(h.options["timeout_seconds"], "checks.host.timeout_seconds")
     _text(b.options["sensor_entity"], "checks.backup.sensor_entity")
+    _validate_new_checks(checks)
+
+
+def _number_map(value: Any, where: str) -> dict[str, float]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{where}: must be a mapping of entity id to a number")
+    for key, v in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ConfigError(f"{where}: keys must be entity ids")
+        _positive(v, f"{where}.{key}", allow_zero=True)
+    return value
+
+
+def _validate_new_checks(checks: dict[str, CheckConfig]) -> None:
+    s = checks["stale"]
+    o = s.options
+    if s.enabled and not (o["entity_ids"] or o["patterns"]):
+        raise ConfigError("checks.stale: list entity_ids or patterns to watch")
+    _positive(o["max_age_hours"], "checks.stale.max_age_hours")
+    _number_map(o["overrides"], "checks.stale.overrides")
+    _positive(o["startup_grace_minutes"], "checks.stale.startup_grace_minutes", allow_zero=True)
+    _whole(o["max_listed"], "checks.stale.max_listed", 1)
+    b = checks["battery"]
+    o = b.options
+    _positive(o["threshold_percent"], "checks.battery.threshold_percent", allow_zero=True)
+    _number_map(o["overrides"], "checks.battery.overrides")
+    _positive(o["stale_hours"], "checks.battery.stale_hours", allow_zero=True)
+    _positive(o["startup_grace_minutes"], "checks.battery.startup_grace_minutes", allow_zero=True)
+    _whole(o["max_listed"], "checks.battery.max_listed", 1)
+    k = checks["stuck"]
+    o = k.options
+    if k.enabled and not o["entity_ids"]:
+        raise ConfigError("checks.stuck.entity_ids: list at least one entity")
+    if not o["error_states"] and not o["max_unchanged_hours"]:
+        raise ConfigError("checks.stuck: set error_states or max_unchanged_hours (both are empty/off)")
+    _positive(o["max_error_minutes"], "checks.stuck.max_error_minutes", allow_zero=True)
+    _positive(o["max_unchanged_hours"], "checks.stuck.max_unchanged_hours", allow_zero=True)
+    p = checks["plug"]
+    if p.enabled and p.every_seconds < 300:
+        raise ConfigError("checks.plug.every_seconds: at least 300 (it asks the plug each time)")
 
 
 def _validate_push(p: HomeAssistantPushConfig) -> None:
