@@ -4,7 +4,12 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.0.1] - 2026-11-01
+
+A small fix release. Most configs need no change. One exception: the push secret is now
+trimmed before the 16-character minimum is checked, so a secret that only reached 16
+characters because of a stray space or line break is now refused and the service will not
+start. Run `ha-watcher --check-config` before restarting after the upgrade.
 
 ### Fixed
 

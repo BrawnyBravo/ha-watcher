@@ -88,10 +88,10 @@ with a topic name nobody can guess.
    sudo useradd --system --user-group --home /var/lib/ha-watcher ha-watcher
    sudo install -d -o ha-watcher -g ha-watcher -m 750 /var/lib/ha-watcher
    sudo python3 -m venv /opt/ha-watcher/venv
-   sudo /opt/ha-watcher/venv/bin/pip install "ha-watcher @ git+https://github.com/BrawnyBravo/ha-watcher@v1.0.0"
-   # for a Kasa/Tapo plug: "ha-watcher[kasa] @ git+https://github.com/BrawnyBravo/ha-watcher@v1.0.0"
+   sudo /opt/ha-watcher/venv/bin/pip install "ha-watcher @ git+https://github.com/BrawnyBravo/ha-watcher@v1.0.1"
+   # for a Kasa/Tapo plug: "ha-watcher[kasa] @ git+https://github.com/BrawnyBravo/ha-watcher@v1.0.1"
    sudo mkdir -p /etc/ha-watcher
-   base=https://raw.githubusercontent.com/BrawnyBravo/ha-watcher/v1.0.0
+   base=https://raw.githubusercontent.com/BrawnyBravo/ha-watcher/v1.0.1
    sudo curl -fsSL -o /etc/ha-watcher/config.yaml $base/config.example.yaml
    sudo curl -fsSL -o /etc/systemd/system/ha-watcher.service $base/contrib/ha-watcher.service
    ```
@@ -133,7 +133,7 @@ To upgrade later, run the same `pip install` line with the new version tag, then
 ## Quick start: Docker
 
 Release images are published for `linux/amd64`, `linux/arm64` and `linux/arm/v7` (32-bit
-Raspberry Pi OS) as `ghcr.io/brawnybravo/ha-watcher:1` (or a full version such as `1.0.0`).
+Raspberry Pi OS) as `ghcr.io/brawnybravo/ha-watcher:1` (or a full version such as `1.0.1`).
 To build your own instead, in a checkout: `docker build -t ha-watcher .` with BuildKit, the
 default builder since Docker 23. On an older Docker (for example Debian's `docker.io` 20.10)
 use `DOCKER_BUILDKIT=1 docker build -t ha-watcher .` or `docker buildx build --load -t ha-watcher .`.
@@ -302,7 +302,7 @@ notifiers:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `false` | Nothing is ever switched unless this is true. |
-| `driver` | `shelly` | `shelly` (Gen2/Gen3/Gen4 local RPC) or `kasa` (needs the `kasa` extra: install `"ha-watcher[kasa] @ git+https://github.com/BrawnyBravo/ha-watcher@v1.0.0"`). |
+| `driver` | `shelly` | `shelly` (Gen2/Gen3/Gen4 local RPC) or `kasa` (needs the `kasa` extra: install `"ha-watcher[kasa] @ git+https://github.com/BrawnyBravo/ha-watcher@v1.0.1"`). |
 | `host` | required | Plug address, e.g. `192.0.2.20`. |
 | `switch_id` | `0` | Shelly switch channel. |
 | `username` / `password` | none | Shelly digest auth (user `admin`), or Kasa/Tapo credentials if the device needs them. |
