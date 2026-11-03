@@ -19,6 +19,10 @@ watchdog add-ons all stop when it does. ha-watcher sits outside it.
 | `entities` | Selected entities `unavailable`/`unknown` for longer than N minutes | off |
 | `memory` | Any numeric sensor (e.g. System Monitor memory %) above a threshold | off |
 | `host` | TCP connect or ping to the host itself, independent of HA | off |
+| `stale` | Listed (or glob-matched) entities that have not reported for N hours | off |
+| `battery` | `battery` entities below a percentage, or not reporting for N hours | off |
+| `stuck` | Listed entities in an error state, or unchanged, for too long | off |
+| `plug` | The power-cycle plug still answers (query only, never switches) | off |
 
 Every check has a **consecutive-failure debounce** (`failures_before_alert`), its own run
 interval (`every_seconds`), and sends a **recovery message** with the outage length when
@@ -186,6 +190,7 @@ ha-watcher -c config.yaml                 run forever
 ha-watcher -c config.yaml --check-config  validate config (and notifier/plug settings), exit 2 on error
 ha-watcher -c config.yaml --once          one full cycle, print each result, exit 1 if anything failed
 ha-watcher -c config.yaml --test-notify   send a test message to every notifier
+ha-watcher -c config.yaml --check-plug    ask the power-cycle plug for its state; switches nothing, exit 1 if it fails
 ha-watcher -c config.yaml --test-call     place one test phone call (needs the TWILIO_* variables)
 ha-watcher -c config.yaml --health        exit 0 if the running watcher saved a loop in the last
                                           max(5 min, 3 x interval_seconds); used by the Docker HEALTHCHECK
@@ -248,10 +253,68 @@ first alert, >= 1) and `every_seconds` (minimum gap between runs; 0 = every loop
 | `entities` | `entity_ids` (list), `max_unavailable_minutes` (15). Each entity alerts separately, timed from its `last_changed`. A missing entity is a failure. |
 | `memory` | `entity_id`, `max_percent` (90). Any numeric sensor works; above the limit is a failure. |
 | `host` | `host`, `method` (`tcp` or `ping`), `port` (8123, tcp only), `timeout_seconds` (3). Does not use HA at all. |
+| `stale` | See "Stale, battery and stuck checks" below. |
+| `battery` | See below. |
+| `stuck` | See below. |
+| `plug` | See "Plug pre-flight" below. |
 
 Defaults were picked for a daily automatic backup (26 h leaves a 2 h margin) and a
 60-second loop (3 failures = about 3 minutes before the first alert). Measure your own
 healthy response time with `--once` before tightening `max_response_ms`.
+
+### Stale, battery and stuck checks
+
+All three are off by default and need the API (they pause while it is down).
+
+**`stale`** reports entities whose last update is older than `max_age_hours` (24). Watch
+entities by `entity_ids` and/or glob `patterns` (`sensor.*_temperature`), remove some with
+`exclude` (globs), and give single entities their own limit in `overrides`
+(`{sensor.example_rain: 72}`, in hours). The age is `last_reported`, falling back to
+`last_updated`. Everything stale is **one** alert (count plus names, clipped to
+`max_listed`). `unavailable` and `unknown` entities are left to the `entities` check; a
+listed entity that does not exist is reported as "not found". For `startup_grace_minutes`
+(10) after the watcher saw Home Assistant come back from being down, the check waits, so a
+restart does not flood you. Home Assistant does not publish its start time in the API, so
+the watcher uses the moment its own `api`/`core` checks passed again; a watcher that starts
+while Home Assistant is already up applies no grace.
+
+**`battery`** looks at every entity with `device_class: battery` and a numeric state below
+`threshold_percent` (20), with per-entity `overrides` (percent) and an `exclude` glob list.
+Batteries that have not reported for `stale_hours` (48; 0 turns this off) are listed as
+"battery not reporting" in the same single alert. Phones, tablets and watches also have
+battery entities and run down daily; leave them out with `exclude`, for example
+`["sensor.*_phone_battery_level", "sensor.*_tablet_*", "sensor.*_watch_*"]`, or set
+`include` (globs) to look at only those batteries. `exclude` wins over `include`. Low batteries are always reported;
+the "not reporting" part honours `startup_grace_minutes`.
+
+**`stuck`** watches the listed `entity_ids`, one alert each. It fails when the state is in
+`error_states` (default `[error]`, case-insensitive) for more than `max_error_minutes` (10),
+or, if `max_unchanged_hours` is above 0, when `last_changed` is older than that. Unavailable
+entities are left to the `entities` check.
+
+### Plug pre-flight
+
+The power cycle is the last resort, so the plug has to work when it is needed. TP-Link is
+moving newer Kasa/Tapo firmware to a new login method that python-kasa does not support
+yet (python-kasa issue 1590); a plug that silently stops accepting python-kasa would make a
+power cycle fail during an outage. Shelly plugs use a plain local API and are the supported
+choice. Two query-only tools help:
+
+- `ha-watcher --check-plug` connects to the configured plug and prints whether it answers
+  and whether it is on. For Kasa it also prints the model, firmware and connection
+  encryption python-kasa reports. It never switches anything and exits 1 with a hint when
+  the plug does not answer.
+- `checks.plug.enabled: true` (needs `power_cycle.enabled`) asks the plug the same
+  question every `every_seconds` (86400, one day; at least 300) and alerts if it stops
+  answering, so a broken plug is found before an outage. Shelly uses `Switch.GetStatus`.
+
+**Lockout risk (Kasa):** every Kasa query is a full login, and failed logins count toward
+the plug's own lockout. So for a Kasa plug the `plug` check needs `every_seconds` of at least
+21600 (6 h), and after a failed query it backs off (the wait doubles each failure, up to 7
+days, and resets on the first success; kept in the state file). `--check-plug` makes exactly
+one attempt and never retries.
+
+Neither path calls turn-off or turn-on; a test enforces that.
 
 ### `alerts`
 

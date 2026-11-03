@@ -28,6 +28,7 @@ STARTING_STATES = {"NOT_RUNNING", "STARTING"}
 RETRY_KEYS = ("retry_at", "retries", "held")
 MAX_RETRY_WAIT = timedelta(minutes=5)
 STARTUP_HOLD = timedelta(minutes=15)
+PLUG_MAX_WAIT = 7 * 86400  # seconds
 # Wall clock and monotonic clock may drift apart this much between loops before the
 # watcher decides the system clock was changed (e.g. NTP setting a clock-less Pi).
 CLOCK_SLACK = timedelta(minutes=2)
@@ -189,6 +190,7 @@ class Watcher:
             holder[key] = [t if parse(t) <= now else stamp for t in holder[key]]
         singles = [
             (self.state, "deadman_last"),
+            (self.state, "ha_up_since"),
             (self.state["power"], "busy_seen"),
             (phone, "last_attempt"),
             (self.state["expiry"], "rdap_backoff_until"),
@@ -206,7 +208,8 @@ class Watcher:
 
     # ------------------------------------------------------------------ checks
     def _run_checks(self, now: datetime) -> tuple[list[Result], set[str]]:
-        ctx = Context(now=now, **self.ctx_hooks)
+        hooks = {"plug_status": getattr(self.driver, "status", None), **self.ctx_hooks}
+        ctx = Context(now=now, **hooks)
         results: list[Result] = []
         ran: set[str] = set()
         api_down = False
@@ -217,10 +220,16 @@ class Watcher:
             if name in NEEDS_API and api_down:
                 continue  # keep previous state; the api alert already says HA is down
             last = parse(self.state["last_run"].get(name))
-            if ccfg.every_seconds and last and (now - last).total_seconds() < ccfg.every_seconds:
+            wait = ccfg.every_seconds
+            if name == "plug":
+                # A failed query backs off (x2 per failure, up to 7 days): each Kasa query is a
+                # login, and failed logins count toward the plug's own lockout.
+                wait = min(wait * 2 ** self.state["plug_fails"], PLUG_MAX_WAIT)
+            if wait and last and (now - last).total_seconds() < wait:
                 if name == "api":
                     api_down = self._failing("api")
                 continue
+            ctx.ha_up_since = parse(self.state["ha_up_since"])
             try:
                 out = fn(self.client, ccfg.options, ctx)
             except Exception as exc:  # noqa: BLE001 - one broken check must not stop the rest
@@ -233,7 +242,30 @@ class Watcher:
             self.state["last_run"][name] = ts(now)
             if name == "api":
                 api_down = not all(r.ok for r in out)
+            if name == "plug":
+                self.state["plug_fails"] = (
+                    0 if all(r.ok for r in out) else min(self.state["plug_fails"] + 1, 10)
+                )
+            self._track_ha_up(name, out, now)
         return results, ran
+
+    def _track_ha_up(self, name: str, out: list[Result], now: datetime) -> None:
+        """Remember when Home Assistant last came back, for the checks' startup grace.
+
+        The API check failing, or Core not RUNNING, marks it down; the next time the
+        last of those checks passes, "up since" is set to now. A watcher that starts
+        while Home Assistant is already up sets nothing (no grace is needed).
+        """
+        if name not in ("api", "core"):
+            return
+        st = self.state
+        if any(not r.ok for r in out if r.key == name):
+            st["ha_down"] = True
+            return
+        last = "core" if self.cfg.checks["core"].enabled else "api"
+        if name == last and st["ha_down"]:
+            st["ha_down"] = False
+            st["ha_up_since"] = ts(now)
 
     def _failing(self, key: str) -> bool:
         st = self.state["checks"].get(key)
