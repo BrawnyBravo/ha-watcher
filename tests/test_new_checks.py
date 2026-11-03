@@ -469,3 +469,96 @@ def test_stale_grace_follows_a_restart_seen_by_the_engine(tmp_path):
     assert r.ok and "just started" in r.message
     [r] = [r for r in w.run_once(back + 11 * M) if r.key == "stale"]
     assert not r.ok
+
+
+# ------------------------------------------------- plug lockout care, battery include
+def test_kasa_plug_check_needs_six_hour_interval():
+    kasa = {"power_cycle": {"enabled": True, "driver": "kasa", "host": "192.0.2.20"}}
+    with pytest.raises(ConfigError, match="21600"):
+        parse_config(
+            base_raw(**kasa, checks={"plug": {"enabled": True, "every_seconds": 3600}}),
+            env={"HA_TOKEN": TOKEN},
+        )
+    cfg = parse_config(base_raw(**kasa, checks={"plug": {"enabled": True}}), env={"HA_TOKEN": TOKEN})
+    assert cfg.checks["plug"].every_seconds == 86400
+    shelly = {"power_cycle": {"enabled": True, "host": "192.0.2.20"}}
+    parse_config(
+        base_raw(**shelly, checks={"plug": {"enabled": True, "every_seconds": 600}}),
+        env={"HA_TOKEN": TOKEN},
+    )
+
+
+def test_plug_check_backs_off_after_failure_and_resets(tmp_path):
+    class Flaky:
+        def __init__(self):
+            self.calls = 0
+            self.fail = True
+
+        def status(self):
+            self.calls += 1
+            if self.fail:
+                raise PowerError("Kasa failed: AuthenticationError")
+            return {"driver": "kasa", "on": True}
+
+    drv = Flaky()
+    cfg = make_cfg(
+        power_cycle={"enabled": True, "driver": "kasa", "host": "192.0.2.20"},
+        checks={"plug": {"enabled": True}, "backup": {"enabled": False}},
+    )
+    w = Watcher(
+        cfg,
+        make_client(FakeHA(), cfg=cfg),
+        [],
+        httpx.Client(),
+        driver=drv,
+        local_tz=UTC,
+        state_path=str(tmp_path / "s.json"),
+    )
+    w.run_once(NOW)  # fail 1: next try after 2 days
+    w.run_once(NOW + 25 * H)
+    w.run_once(NOW + 47 * H)
+    assert drv.calls == 1
+    w.run_once(NOW + 49 * H)  # fail 2: next try after 4 days
+    assert drv.calls == 2 and w.state["plug_fails"] == 2
+    w.run_once(NOW + 49 * H + 3 * 24 * H)
+    assert drv.calls == 2
+    drv.fail = False
+    w.run_once(NOW + 49 * H + 5 * 24 * H)
+    assert drv.calls == 3 and w.state["plug_fails"] == 0
+    w.run_once(NOW + 49 * H + 5 * 24 * H + 25 * H)  # back to the normal day
+    assert drv.calls == 4
+
+
+def test_plug_backoff_is_capped_at_seven_days():
+    from ha_watcher.engine import PLUG_MAX_WAIT
+
+    assert PLUG_MAX_WAIT == 7 * 86400
+
+
+def test_check_plug_makes_exactly_one_attempt():
+    calls = []
+
+    async def discover(host, username=None, password=None):
+        calls.append(host)
+        raise OSError("login refused")
+
+    with pytest.raises(PowerError):
+        KasaDriver(pc(driver="kasa"), discover=discover).status()
+    assert len(calls) == 1
+
+
+def test_battery_include_only_and_exclude_globs():
+    client = ha_with(
+        ent("sensor.example_door_battery", "5", age=H, device_class="battery"),
+        ent("sensor.example_phone_battery_level", "4", age=H, device_class="battery"),
+        ent("sensor.example_tablet_battery_level", "3", age=H, device_class="battery"),
+        ent("sensor.example_watch_battery", "2", age=H, device_class="battery"),
+    )
+    [r] = checks.check_battery(client, opts("battery", exclude=["*phone*", "*tablet*", "*watch*"]), CTX)
+    assert r.data["low"] == ["sensor.example_door_battery 5%"]
+    [r] = checks.check_battery(client, opts("battery", include=["*watch*", "*door*"]), CTX)
+    assert len(r.data["low"]) == 2 and "phone" not in r.message
+    [r] = checks.check_battery(client, opts("battery", include=["*door*"], exclude=["*door*"]), CTX)
+    assert r.ok  # exclude wins over include
+    with pytest.raises(ConfigError, match="include"):
+        parse_config(base_raw(checks={"battery": {"include": "sensor.x"}}), env={"HA_TOKEN": TOKEN})

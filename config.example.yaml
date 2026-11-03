@@ -73,7 +73,10 @@ checks:
     every_seconds: 1800
     threshold_percent: 20
     overrides: {}              # per entity, percent: {sensor.example_door_battery: 10}
-    exclude: []                # globs
+    include: []                # globs; if set, ONLY these batteries are looked at
+    exclude: []                # globs. Phones, tablets and watches run down every day and
+                               # would alert daily; exclude them, for example:
+                               # exclude: ["sensor.*_phone_battery_level", "sensor.*_tablet_*", "sensor.*_watch_*"]
     stale_hours: 48            # "battery not reporting" after this long; 0 = off
     startup_grace_minutes: 10
     max_listed: 10
@@ -89,7 +92,9 @@ checks:
 
   plug:                        # needs power_cycle.enabled; asks the plug for its state
     enabled: false             # query only, never switches. Test by hand: ha-watcher --check-plug
-    every_seconds: 86400       # once a day
+    every_seconds: 86400       # once a day. Kasa: at least 21600 (6 h). Every query is a login and
+                               # failed logins count toward the plug's lockout, so after a failed
+                               # query the check backs off (doubling, up to 7 days) until it works
 
 alerts:
   realert_minutes: 60         # remind while still failing; 0 = once per outage

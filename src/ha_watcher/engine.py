@@ -28,6 +28,7 @@ STARTING_STATES = {"NOT_RUNNING", "STARTING"}
 RETRY_KEYS = ("retry_at", "retries", "held")
 MAX_RETRY_WAIT = timedelta(minutes=5)
 STARTUP_HOLD = timedelta(minutes=15)
+PLUG_MAX_WAIT = 7 * 86400  # seconds
 # Wall clock and monotonic clock may drift apart this much between loops before the
 # watcher decides the system clock was changed (e.g. NTP setting a clock-less Pi).
 CLOCK_SLACK = timedelta(minutes=2)
@@ -219,7 +220,12 @@ class Watcher:
             if name in NEEDS_API and api_down:
                 continue  # keep previous state; the api alert already says HA is down
             last = parse(self.state["last_run"].get(name))
-            if ccfg.every_seconds and last and (now - last).total_seconds() < ccfg.every_seconds:
+            wait = ccfg.every_seconds
+            if name == "plug":
+                # A failed query backs off (x2 per failure, up to 7 days): each Kasa query is a
+                # login, and failed logins count toward the plug's own lockout.
+                wait = min(wait * 2 ** self.state["plug_fails"], PLUG_MAX_WAIT)
+            if wait and last and (now - last).total_seconds() < wait:
                 if name == "api":
                     api_down = self._failing("api")
                 continue
@@ -236,6 +242,10 @@ class Watcher:
             self.state["last_run"][name] = ts(now)
             if name == "api":
                 api_down = not all(r.ok for r in out)
+            if name == "plug":
+                self.state["plug_fails"] = (
+                    0 if all(r.ok for r in out) else min(self.state["plug_fails"] + 1, 10)
+                )
             self._track_ha_up(name, out, now)
         return results, ran
 

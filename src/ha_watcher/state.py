@@ -27,6 +27,7 @@ def empty_state() -> dict[str, Any]:
         "deadman_last": None,
         "last_loop": None,
         "ha_down": False,  # the API or Core was failing at the last look
+        "plug_fails": 0,  # failed plug queries in a row (the plug check backs off)
         "ha_up_since": None,  # when Home Assistant last came back (startup grace for some checks)
         # dry_* lists: what a dry run would have done, so it keeps the same cooldown and cap
         # (one message per would-be action) without counting against the real ones.

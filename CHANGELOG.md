@@ -17,6 +17,9 @@ All notable changes to this project are documented here. The format follows
   batteries that stopped reporting.
 - `checks.stuck`: per-entity alert when an entity sits in an error state, or does not change,
   for too long.
+- `checks.battery.include` (globs; only these) next to `exclude`, for phones and watches.
+- The Kasa `plug` check needs `every_seconds` >= 21600 and backs off after failed queries
+  (up to 7 days), because failed logins count toward the plug's lockout.
 - All four are off by default. The state file gains `ha_down` and `ha_up_since` (older
   files load as before).
 

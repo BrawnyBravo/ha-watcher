@@ -256,6 +256,7 @@ CHECK_DEFAULTS: dict[str, dict[str, Any]] = {
         "every_seconds": 1800,
         "threshold_percent": 20,
         "overrides": {},  # entity_id -> percent
+        "include": [],  # globs; if set, only these batteries are looked at
         "exclude": [],  # globs
         "stale_hours": 48,  # 0 = do not flag silent batteries
         "startup_grace_minutes": 10,
@@ -481,6 +482,11 @@ def parse_config(raw: Any, env: dict[str, str] | None = None) -> Config:
     if checks["plug"].enabled and not cfg.power_cycle.enabled:
         raise ConfigError("checks.plug needs power_cycle.enabled (it checks that plug)")
     checks["plug"].options["driver"] = cfg.power_cycle.driver  # for the hint on failure
+    if checks["plug"].enabled and cfg.power_cycle.driver == "kasa" and checks["plug"].every_seconds < 21600:
+        raise ConfigError(
+            "checks.plug.every_seconds: at least 21600 (6 h) for a Kasa plug, because every query "
+            "is a login and failed logins can lock the plug out"
+        )
     _validate_recovery(cfg.recovery_command, checks)
     if (
         cfg.power_cycle.enabled

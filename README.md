@@ -281,7 +281,10 @@ while Home Assistant is already up applies no grace.
 **`battery`** looks at every entity with `device_class: battery` and a numeric state below
 `threshold_percent` (20), with per-entity `overrides` (percent) and an `exclude` glob list.
 Batteries that have not reported for `stale_hours` (48; 0 turns this off) are listed as
-"battery not reporting" in the same single alert. Low batteries are always reported;
+"battery not reporting" in the same single alert. Phones, tablets and watches also have
+battery entities and run down daily; leave them out with `exclude`, for example
+`["sensor.*_phone_battery_level", "sensor.*_tablet_*", "sensor.*_watch_*"]`, or set
+`include` (globs) to look at only those batteries. `exclude` wins over `include`. Low batteries are always reported;
 the "not reporting" part honours `startup_grace_minutes`.
 
 **`stuck`** watches the listed `entity_ids`, one alert each. It fails when the state is in
@@ -304,6 +307,12 @@ choice. Two query-only tools help:
 - `checks.plug.enabled: true` (needs `power_cycle.enabled`) asks the plug the same
   question every `every_seconds` (86400, one day; at least 300) and alerts if it stops
   answering, so a broken plug is found before an outage. Shelly uses `Switch.GetStatus`.
+
+**Lockout risk (Kasa):** every Kasa query is a full login, and failed logins count toward
+the plug's own lockout. So for a Kasa plug the `plug` check needs `every_seconds` of at least
+21600 (6 h), and after a failed query it backs off (the wait doubles each failure, up to 7
+days, and resets on the first success; kept in the state file). `--check-plug` makes exactly
+one attempt and never retries.
 
 Neither path calls turn-off or turn-on; a test enforces that.
 

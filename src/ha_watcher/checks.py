@@ -321,6 +321,8 @@ def check_battery(client: HAClient, opts: dict[str, Any], ctx: Context) -> list[
         eid = st.get("entity_id", "")
         if (st.get("attributes") or {}).get("device_class") != "battery":
             continue
+        if opts["include"] and not _glob_match(eid, opts["include"]):
+            continue
         if _glob_match(eid, opts["exclude"]) or st.get("state") in UNAVAILABLE:
             continue
         level = _number(st.get("state"))
